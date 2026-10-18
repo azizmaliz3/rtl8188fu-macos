@@ -1,0 +1,19 @@
+name: CI
+on: [push, workflow_dispatch]
+jobs:
+  probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: acidanthera/MacKernelSDK
+          path: MacKernelSDK
+      - run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcode-select -p
+      - run: |
+          ls MacKernelSDK MacKernelSDK/Library MacKernelSDK/Library/x86_64
+          grep -rn "__ACIDANTHERA_MAC_SDK" MacKernelSDK/Headers | head -3
