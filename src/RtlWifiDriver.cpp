@@ -19,10 +19,14 @@ bool RtlWifiDriver::start(IOService *provider) {
     fDevice = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v2");
+    setProperty("build-tag", "v3");
     fDevice = OSDynamicCast(IOUSBHostDevice, provider);
     if (!fDevice) { IOLog("RtlWifi: provider is not IOUSBHostDevice\n"); return false; }
     if (!fDevice->open(this)) { IOLog("RtlWifi: open failed\n"); fDevice = nullptr; return false; }
+    uint32_t sysCfg = 0;
+    IOReturn rr = readReg(0x00F0, &sysCfg, sizeof(sysCfg));
+    setProperty("readreg-status", (uint64_t)rr, 32);
+    setProperty("sys-cfg", (uint64_t)sysCfg, 32);
     uint8_t r8 = 0;
     uint32_t r32 = 0, r68 = 0;
     IOReturn a = readReg(0x00FC, &r8, 1);
