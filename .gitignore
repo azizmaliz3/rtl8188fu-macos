@@ -3,3 +3,4 @@ build/
 MacKernelSDK/
 ci-log.txt
 ci-log.txt
+artifacts/
