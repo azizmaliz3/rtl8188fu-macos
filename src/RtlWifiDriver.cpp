@@ -1,6 +1,7 @@
 #include "RtlWifiDriver.hpp"
 #include "rtl8188fufw.h"          // generated: rtl8188fufw_bin[], rtl8188fufw_bin_len
 #include <IOKit/IOLib.h>
+#include <libkern/libkern.h>
 
 #define super IOService
 OSDefineMetaClassAndStructors(RtlWifiDriver, IOService)
@@ -17,6 +18,13 @@ OSDefineMetaClassAndStructors(RtlWifiDriver, IOService)
 #define REG_CR            0x0100
 #define REG_TRXFF_BNDY    0x0114
 #define REG_FW_START_ADDR 0x1000
+#define REG_SYS_ISO_CTRL  0x0000
+#define REG_SYS_CLKR      0x0008
+#define REG_EFUSE_CTRL    0x0030
+#define REG_EFUSE_ACCESS  0x00CF
+#define EFUSE_MAP_LEN     512
+#define EFUSE_ACCESS_ON   0x69
+#define EFUSE_ACCESS_OFF  0x00
 
 #define FW_HEADER_SIZE    32      // sizeof(struct rtl8xxxu_firmware_header)
 #define FW_PAGE_SIZE      4096    // RTL_FW_PAGE_SIZE
@@ -232,13 +240,97 @@ IOReturn RtlWifiDriver::startFirmware() {
     return kIOReturnSuccess;
 }
 
+// ---------- eFuse read (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse) ----------
+
+IOReturn RtlWifiDriver::readEfuse8(uint16_t offset, uint8_t *data) {
+    wr8(REG_EFUSE_CTRL + 1, offset & 0xff);
+    uint8_t v8 = rd8(REG_EFUSE_CTRL + 2);
+    v8 &= 0xfc;
+    v8 |= (offset >> 8) & 0x03;
+    wr8(REG_EFUSE_CTRL + 2, v8);
+
+    v8 = rd8(REG_EFUSE_CTRL + 3);
+    wr8(REG_EFUSE_CTRL + 3, v8 & 0x7f);
+
+    uint32_t v32 = 0;
+    int i;
+    for (i = 0; i < POLL_MAX_REG; i++) {      // poll for data ready (bit 31)
+        v32 = rd32(REG_EFUSE_CTRL);
+        if (v32 & BIT(31)) break;
+    }
+    if (i == POLL_MAX_REG) return kIOReturnIOError;
+
+    IODelay(50);
+    v32 = rd32(REG_EFUSE_CTRL);
+    *data = (uint8_t)(v32 & 0xff);
+    return kIOReturnSuccess;
+}
+
+IOReturn RtlWifiDriver::readEfuse() {
+    IOReturn ret = kIOReturnSuccess;
+    uint16_t v16, addr = 0, offset, mapAddr;
+    uint8_t header = 0, ext = 0, val8 = 0, wordMask;
+    int i;
+
+    wr8(REG_EFUSE_ACCESS, EFUSE_ACCESS_ON);
+
+    v16 = rd16(REG_SYS_ISO_CTRL);             // 1.2V power
+    if (!(v16 & BIT(15))) { v16 |= BIT(15); wr16(REG_SYS_ISO_CTRL, v16); }
+
+    v16 = rd16(REG_SYS_FUNC);                 // loader reset
+    if (!(v16 & BIT(12))) { v16 |= BIT(12); wr16(REG_SYS_FUNC, v16); }
+
+    v16 = rd16(REG_SYS_CLKR);                 // loader clock + ANA 8M
+    if (!(v16 & BIT(5)) || !(v16 & BIT(1))) {
+        v16 |= (BIT(5) | BIT(1));
+        wr16(REG_SYS_CLKR, v16);
+    }
+
+    memset(fEfuse, 0xff, sizeof(fEfuse));
+
+    while (addr < EFUSE_MAP_LEN) {
+        ret = readEfuse8(addr++, &header);
+        if (ret != kIOReturnSuccess || header == 0xff) goto exit;
+
+        if ((header & 0x1f) == 0x0f) {        // extended header
+            offset = (header & 0xe0) >> 5;
+            ret = readEfuse8(addr++, &ext);
+            if (ret != kIOReturnSuccess) goto exit;
+            if ((ext & 0x0f) == 0x0f) continue;   // all words disabled
+            offset |= ((ext & 0xf0) >> 1);
+            wordMask = ext & 0x0f;
+        } else {
+            offset = (header >> 4) & 0x0f;
+            wordMask = header & 0x0f;
+        }
+
+        mapAddr = offset * 8;
+        for (i = 0; i < 4; i++) {
+            if (wordMask & BIT(i)) { mapAddr += 2; continue; }
+
+            ret = readEfuse8(addr++, &val8);
+            if (ret != kIOReturnSuccess) goto exit;
+            if (mapAddr >= EFUSE_MAP_LEN - 1) { ret = kIOReturnBadArgument; goto exit; }
+            fEfuse[mapAddr++] = val8;
+
+            ret = readEfuse8(addr++, &val8);
+            if (ret != kIOReturnSuccess) goto exit;
+            fEfuse[mapAddr++] = val8;
+        }
+    }
+
+exit:
+    wr8(REG_EFUSE_ACCESS, EFUSE_ACCESS_OFF);
+    return ret;
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
     fDevice = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v4");
+    setProperty("build-tag", "v5");
     fDevice = OSDynamicCast(IOUSBHostDevice, provider);
     if (!fDevice) { IOLog("RtlWifi: provider is not IOUSBHostDevice\n"); return false; }
     if (!fDevice->open(this)) { IOLog("RtlWifi: open failed\n"); fDevice = nullptr; return false; }
@@ -260,6 +352,17 @@ bool RtlWifiDriver::start(IOService *provider) {
     r = startFirmware();
     setProperty("fw-start-status", (uint64_t)(uint32_t)r, 32);
     setProperty("mcu-fw-dl-reg-final", (uint64_t)rd32(REG_MCU_FW_DL), 32);
+
+    r = readEfuse();
+    setProperty("efuse-status", (uint64_t)(uint32_t)r, 32);
+    setProperty("efuse-map", fEfuse, sizeof(fEfuse));
+    uint16_t rtlId = (uint16_t)(fEfuse[0] | (fEfuse[1] << 8));
+    setProperty("efuse-rtl-id", (uint64_t)rtlId, 16);      // expected 0x8129 = 33065
+    char mac[20];
+    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+             fEfuse[0xd7], fEfuse[0xd8], fEfuse[0xd9],
+             fEfuse[0xda], fEfuse[0xdb], fEfuse[0xdc]);
+    setProperty("mac-address-str", mac);
     return true;
 }
 

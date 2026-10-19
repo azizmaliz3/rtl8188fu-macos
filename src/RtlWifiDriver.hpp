@@ -24,6 +24,11 @@ class RtlWifiDriver : public IOService {
     IOReturn downloadFirmware();
     IOReturn startFirmware();
 
+    // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
+    IOReturn readEfuse8(uint16_t offset, uint8_t *data);
+    IOReturn readEfuse();
+    uint8_t  fEfuse[512];
+
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
