@@ -330,12 +330,21 @@ bool RtlWifiDriver::start(IOService *provider) {
     fDevice = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v5");
+    setProperty("build-tag", "v6");
     fDevice = OSDynamicCast(IOUSBHostDevice, provider);
     if (!fDevice) { IOLog("RtlWifi: provider is not IOUSBHostDevice\n"); return false; }
     if (!fDevice->open(this)) { IOLog("RtlWifi: open failed\n"); fDevice = nullptr; return false; }
 
     setProperty("sys-cfg", (uint64_t)rd32(0x00F0), 32);
+
+    // Raw USB configuration descriptor (interfaces + endpoints) for endpoint layout analysis
+    const StandardUSB::ConfigurationDescriptor *cd = fDevice->getConfigurationDescriptor(0);
+    if (cd) {
+        setProperty("config-descriptor", const_cast<StandardUSB::ConfigurationDescriptor *>(cd), cd->wTotalLength);
+        setProperty("config-descriptor-len", (uint64_t)cd->wTotalLength, 16);
+    } else {
+        setProperty("config-descriptor-missing", kOSBooleanTrue);
+    }
 
     IOReturn r = powerOn();
     setProperty("power-on-status", (uint64_t)(uint32_t)r, 32);
