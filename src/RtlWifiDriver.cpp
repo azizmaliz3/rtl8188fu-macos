@@ -1,5 +1,6 @@
 #include "RtlWifiDriver.hpp"
 #include "rtl8188fufw.h"          // generated: rtl8188fufw_bin[], rtl8188fufw_bin_len
+#include "RtlWifiTables.h"         // generated: kRtl8188fMacTable[]
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
 
@@ -18,6 +19,17 @@ OSDefineMetaClassAndStructors(RtlWifiDriver, IOService)
 #define REG_CR            0x0100
 #define REG_TRXFF_BNDY    0x0114
 #define REG_FW_START_ADDR 0x1000
+#define REG_TRXDMA_CTRL   0x010C
+#define REG_RQPN          0x0200
+#define REG_RQPN_NPQ      0x0214
+
+#define TX_TOTAL_PAGE_NUM    0xF7   // TX_TOTAL_PAGE_NUM_8188F
+#define TX_PAGE_NUM_HI_PQ    0x0C
+#define TX_PAGE_NUM_LO_PQ    0x02
+#define TX_PAGE_NUM_NORM_PQ  0x02
+#define TRXDMA_QUEUE_LOW     1
+#define TRXDMA_QUEUE_NORMAL  2
+#define TRXDMA_QUEUE_HIGH    3
 #define REG_SYS_ISO_CTRL  0x0000
 #define REG_SYS_CLKR      0x0008
 #define REG_EFUSE_CTRL    0x0030
@@ -324,6 +336,90 @@ exit:
     return ret;
 }
 
+// ---------- queue setup and MAC init ----------
+
+// rtl8xxxu_config_endpoints_no_sie (used by the 8188F)
+void RtlWifiDriver::configEndpoints(uint8_t nrOutEps) {
+    fEpTxHigh = fEpTxNormal = fEpTxLow = fEpTxCount = 0;
+    if (nrOutEps >= 3) { fEpTxLow = 1; fEpTxCount++; }
+    if (nrOutEps >= 2) { fEpTxNormal = 1; fEpTxCount++; }
+    if (nrOutEps >= 1) { fEpTxHigh = 1; fEpTxCount++; }
+}
+
+void RtlWifiDriver::initQueueReservedPage() {
+    uint32_t hq = 0, lq = 0, nq = 0, eq = 0, pubq;
+    if (fEpTxHigh)   hq = TX_PAGE_NUM_HI_PQ;
+    if (fEpTxLow)    lq = TX_PAGE_NUM_LO_PQ;
+    if (fEpTxNormal) nq = TX_PAGE_NUM_NORM_PQ;
+
+    wr32(REG_RQPN_NPQ, (nq << 0) | (eq << 16));
+
+    pubq = TX_TOTAL_PAGE_NUM - hq - lq - nq - 1;
+    uint32_t v = BIT(31) | (hq << 0) | (lq << 8) | (pubq << 16);   // RQPN_LOAD
+    wr32(REG_RQPN, v);
+}
+
+IOReturn RtlWifiDriver::initQueuePriority() {
+    uint16_t hi = 0, lo = 0;
+    uint16_t hiq, mgq, bkq, beq, viq, voq;
+
+    switch (fEpTxCount) {
+    case 1:
+        if (fEpTxHigh) hi = TRXDMA_QUEUE_HIGH;
+        else if (fEpTxLow) hi = TRXDMA_QUEUE_LOW;
+        else if (fEpTxNormal) hi = TRXDMA_QUEUE_NORMAL;
+        else return kIOReturnBadArgument;
+        hiq = mgq = bkq = beq = viq = voq = hi;
+        break;
+    case 2:
+        if (fEpTxHigh && fEpTxLow)         { hi = TRXDMA_QUEUE_HIGH;   lo = TRXDMA_QUEUE_LOW; }
+        else if (fEpTxNormal && fEpTxLow)  { hi = TRXDMA_QUEUE_NORMAL; lo = TRXDMA_QUEUE_LOW; }
+        else if (fEpTxHigh && fEpTxNormal) { hi = TRXDMA_QUEUE_HIGH;   lo = TRXDMA_QUEUE_NORMAL; }
+        else return kIOReturnBadArgument;
+        hiq = mgq = viq = voq = hi;
+        bkq = beq = lo;
+        break;
+    case 3:
+        beq = bkq = TRXDMA_QUEUE_LOW;
+        viq = TRXDMA_QUEUE_NORMAL;
+        voq = mgq = hiq = TRXDMA_QUEUE_HIGH;
+        break;
+    default:
+        return kIOReturnBadArgument;
+    }
+
+    uint16_t v = rd16(REG_TRXDMA_CTRL);
+    v &= 0x7;
+    v |= (voq << 4) | (viq << 6) | (beq << 8) | (bkq << 10) | (mgq << 12) | (hiq << 14);
+    wr16(REG_TRXDMA_CTRL, v);
+    return kIOReturnSuccess;
+}
+
+// rtl8xxxu_init_mac: write the 8188F MAC table (8-bit writes); the 8188F has no extra tail writes
+IOReturn RtlWifiDriver::initMac() {
+    uint32_t writeErrors = 0, mismatches = 0;
+    char first[32] = "none";
+
+    for (unsigned int i = 0; i < kRtl8188fMacTableLen; i++) {
+        uint8_t v = kRtl8188fMacTable[i].val;
+        if (writeReg(kRtl8188fMacTable[i].reg, &v, 1) != kIOReturnSuccess) writeErrors++;
+    }
+    for (unsigned int i = 0; i < kRtl8188fMacTableLen; i++) {      // informational read-back
+        uint8_t got = rd8(kRtl8188fMacTable[i].reg);
+        if (got != kRtl8188fMacTable[i].val) {
+            if (!mismatches)
+                snprintf(first, sizeof(first), "%04x got %02x want %02x",
+                         kRtl8188fMacTable[i].reg, got, kRtl8188fMacTable[i].val);
+            mismatches++;
+        }
+    }
+    setProperty("mac-table-count", (uint64_t)kRtl8188fMacTableLen, 32);
+    setProperty("mac-table-write-errors", (uint64_t)writeErrors, 32);
+    setProperty("mac-table-readback-mismatch", (uint64_t)mismatches, 32);
+    setProperty("mac-table-first-mismatch", first);
+    return writeErrors ? kIOReturnIOError : kIOReturnSuccess;
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -331,7 +427,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v7");
+    setProperty("build-tag", "v8");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -351,7 +447,18 @@ bool RtlWifiDriver::start(IOService *provider) {
     setProperty("fsmco-after-power-on", (uint64_t)rd32(REG_APS_FSMCO), 32);
     if (r != kIOReturnSuccess) return true;   // stay attached so properties can be read
 
+    // Queue setup, in the reference order (before the firmware download)
+    configEndpoints((fPipeOut2 ? 1 : 0) + (fPipeOut3 ? 1 : 0));
+    setProperty("ep-tx-count", (uint64_t)fEpTxCount, 8);
+    initQueueReservedPage();
+    r = initQueuePriority();
+    setProperty("queue-priority-status", (uint64_t)(uint32_t)r, 32);
+    setProperty("rqpn-npq-readback", (uint64_t)rd32(REG_RQPN_NPQ), 32);
+    setProperty("rqpn-readback", (uint64_t)rd32(REG_RQPN), 32);
+    setProperty("trxdma-ctrl-readback", (uint64_t)rd16(REG_TRXDMA_CTRL), 16);
+
     wr16(REG_TRXFF_BNDY + 2, 0x3f7f);         // rtl8188fu_fops.trxff_boundary
+    setProperty("trxff-bndy-hi-readback", (uint64_t)rd16(REG_TRXFF_BNDY + 2), 16);
 
     r = downloadFirmware();
     setProperty("fw-dl-status", (uint64_t)(uint32_t)r, 32);
@@ -361,6 +468,11 @@ bool RtlWifiDriver::start(IOService *provider) {
     r = startFirmware();
     setProperty("fw-start-status", (uint64_t)(uint32_t)r, 32);
     setProperty("mcu-fw-dl-reg-final", (uint64_t)rd32(REG_MCU_FW_DL), 32);
+
+    if (r == kIOReturnSuccess) {
+        r = initMac();
+        setProperty("init-mac-status", (uint64_t)(uint32_t)r, 32);
+    }
 
     r = readEfuse();
     setProperty("efuse-status", (uint64_t)(uint32_t)r, 32);

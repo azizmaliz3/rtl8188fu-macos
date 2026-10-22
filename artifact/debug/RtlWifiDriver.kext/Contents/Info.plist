@@ -51,7 +51,11 @@
 			<key>IOProbeScore</key>
 			<integer>4000</integer>
 			<key>IOProviderClass</key>
-			<string>IOUSBHostDevice</string>
+			<string>IOUSBHostInterface</string>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>0</integer>
 			<key>idProduct</key>
 			<integer>61817</integer>
 			<key>idVendor</key>

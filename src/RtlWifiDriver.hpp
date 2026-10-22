@@ -28,6 +28,13 @@ class RtlWifiDriver : public IOService {
     IOReturn downloadFirmware();
     IOReturn startFirmware();
 
+    // Queue/MAC init (rtl8xxxu_init_queue_reserved_page / _priority / _init_mac)
+    uint8_t  fEpTxHigh, fEpTxNormal, fEpTxLow, fEpTxCount;
+    void     configEndpoints(uint8_t nrOutEps);
+    void     initQueueReservedPage();
+    IOReturn initQueuePriority();
+    IOReturn initMac();
+
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);
     IOReturn readEfuse();
