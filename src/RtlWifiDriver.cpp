@@ -42,7 +42,7 @@ IOReturn RtlWifiDriver::readReg(uint16_t reg, void *buf, uint16_t len) {
     req.wIndex = 0;
     req.wLength = len;
     uint32_t got = 0;
-    return fDevice->deviceRequest(this, req, buf, got, 1000);
+    return fInterface->deviceRequest(req, buf, got, 1000);
 }
 
 IOReturn RtlWifiDriver::writeReg(uint16_t reg, const void *buf, uint16_t len) {
@@ -53,7 +53,7 @@ IOReturn RtlWifiDriver::writeReg(uint16_t reg, const void *buf, uint16_t len) {
     req.wIndex = 0;
     req.wLength = len;
     uint32_t got = 0;
-    return fDevice->deviceRequest(this, req, const_cast<void *>(buf), got, 1000);
+    return fInterface->deviceRequest(req, const_cast<void *>(buf), got, 1000);
 }
 
 uint8_t  RtlWifiDriver::rd8(uint16_t reg)  { uint8_t  v = 0; readReg(reg, &v, 1); return v; }
@@ -327,24 +327,24 @@ exit:
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
-    fDevice = nullptr;
+    fInterface = nullptr;
+    fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v6");
-    fDevice = OSDynamicCast(IOUSBHostDevice, provider);
-    if (!fDevice) { IOLog("RtlWifi: provider is not IOUSBHostDevice\n"); return false; }
-    if (!fDevice->open(this)) { IOLog("RtlWifi: open failed\n"); fDevice = nullptr; return false; }
+    setProperty("build-tag", "v7");
+    fInterface = OSDynamicCast(IOUSBHostInterface, provider);
+    if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
+    if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
+
+    // Bulk pipes from the configuration descriptor: IN 0x81, OUT 0x02, OUT 0x03
+    fPipeIn   = fInterface->copyPipe(0x81);
+    fPipeOut2 = fInterface->copyPipe(0x02);
+    fPipeOut3 = fInterface->copyPipe(0x03);
+    setProperty("pipe-in-0x81", fPipeIn ? kOSBooleanTrue : kOSBooleanFalse);
+    setProperty("pipe-out-0x02", fPipeOut2 ? kOSBooleanTrue : kOSBooleanFalse);
+    setProperty("pipe-out-0x03", fPipeOut3 ? kOSBooleanTrue : kOSBooleanFalse);
 
     setProperty("sys-cfg", (uint64_t)rd32(0x00F0), 32);
-
-    // Raw USB configuration descriptor (interfaces + endpoints) for endpoint layout analysis
-    const StandardUSB::ConfigurationDescriptor *cd = fDevice->getConfigurationDescriptor(0);
-    if (cd) {
-        setProperty("config-descriptor", const_cast<StandardUSB::ConfigurationDescriptor *>(cd), cd->wTotalLength);
-        setProperty("config-descriptor-len", (uint64_t)cd->wTotalLength, 16);
-    } else {
-        setProperty("config-descriptor-missing", kOSBooleanTrue);
-    }
 
     IOReturn r = powerOn();
     setProperty("power-on-status", (uint64_t)(uint32_t)r, 32);
@@ -376,7 +376,10 @@ bool RtlWifiDriver::start(IOService *provider) {
 }
 
 void RtlWifiDriver::stop(IOService *provider) {
-    if (fDevice) { fDevice->close(this); fDevice = nullptr; }
+    if (fPipeIn)   { fPipeIn->release();   fPipeIn = nullptr; }
+    if (fPipeOut2) { fPipeOut2->release(); fPipeOut2 = nullptr; }
+    if (fPipeOut3) { fPipeOut3->release(); fPipeOut3 = nullptr; }
+    if (fInterface) { fInterface->close(this); fInterface = nullptr; }
     IOLog("RtlWifi: stopped\n");
     super::stop(provider);
 }

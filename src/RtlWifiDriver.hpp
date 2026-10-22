@@ -1,11 +1,15 @@
 #ifndef RtlWifiDriver_hpp
 #define RtlWifiDriver_hpp
 #include <IOKit/IOService.h>
-#include <IOKit/usb/IOUSBHostDevice.h>
+#include <IOKit/usb/IOUSBHostInterface.h>
+#include <IOKit/usb/IOUSBHostPipe.h>
 
 class RtlWifiDriver : public IOService {
     OSDeclareDefaultStructors(RtlWifiDriver)
-    IOUSBHostDevice *fDevice;
+    IOUSBHostInterface *fInterface;
+    IOUSBHostPipe *fPipeIn;     // bulk IN  0x81
+    IOUSBHostPipe *fPipeOut2;   // bulk OUT 0x02
+    IOUSBHostPipe *fPipeOut3;   // bulk OUT 0x03
 
     // Raw vendor-request register access (request 0x05, 0xC0 read / 0x40 write)
     IOReturn readReg(uint16_t reg, void *buf, uint16_t len);
