@@ -4,6 +4,9 @@
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
 
+struct RtlReg32Val;
+struct RtlRfRegVal;
+
 class RtlWifiDriver : public IOService {
     OSDeclareDefaultStructors(RtlWifiDriver)
     IOUSBHostInterface *fInterface;
@@ -35,6 +38,14 @@ class RtlWifiDriver : public IOService {
     IOReturn initQueuePriority();
     IOReturn initMac();
 
+    // PHY / RF init and deferred MAC steps (rtl8188fu_init_phy_bb / _init_phy_rf / init_device tail)
+    uint8_t  fChipCut;
+    IOReturn writeRfReg(uint8_t reg, uint32_t data);
+    uint32_t initPhyRegs(const struct RtlReg32Val *tbl, unsigned int len);
+    IOReturn initPhyBb();
+    IOReturn initPhyRf();
+    IOReturn postRfInit();
+
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);
     IOReturn readEfuse();
@@ -43,5 +54,7 @@ class RtlWifiDriver : public IOService {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    bool willTerminate(IOService *provider, IOOptionBits options) override;
+    bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) override;
 };
 #endif

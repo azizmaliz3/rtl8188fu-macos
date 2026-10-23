@@ -1,6 +1,7 @@
 #include "RtlWifiDriver.hpp"
 #include "rtl8188fufw.h"          // generated: rtl8188fufw_bin[], rtl8188fufw_bin_len
 #include "RtlWifiTables.h"         // generated: kRtl8188fMacTable[]
+#include "RtlWifiPhyTables.h"      // generated: PHY, AGC and RF tables
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
 
@@ -20,6 +21,14 @@ OSDefineMetaClassAndStructors(RtlWifiDriver, IOService)
 #define REG_TRXFF_BNDY    0x0114
 #define REG_FW_START_ADDR 0x1000
 #define REG_TRXDMA_CTRL   0x010C
+#define REG_RF_CTRL       0x001F
+#define REG_PBP           0x0104
+#define REG_TXDMA_OFFSET_CHK 0x020C
+#define REG_AUTO_LLT      0x0224
+#define REG_FPGA0_XA_HSSI_PARM2 0x0824
+#define REG_FPGA0_XA_LSSI_PARM  0x0840
+#define REG_FPGA0_XA_RF_INT_OE  0x0860
+#define REG_FPGA0_XAB_RF_SW_CTRL 0x0870
 #define REG_RQPN          0x0200
 #define REG_RQPN_NPQ      0x0214
 
@@ -420,6 +429,147 @@ IOReturn RtlWifiDriver::initMac() {
     return writeErrors ? kIOReturnIOError : kIOReturnSuccess;
 }
 
+// ---------- PHY / RF init ----------
+
+// rtl8xxxu_write_rfreg for RF path A
+IOReturn RtlWifiDriver::writeRfReg(uint8_t reg, uint32_t data) {
+    data &= 0x000fffff;                               // FPGA0_LSSI_PARM_DATA_MASK
+    uint32_t dataaddr = ((uint32_t)reg << 20) | data; // FPGA0_LSSI_PARM_ADDR_SHIFT
+    IOReturn r = writeReg(REG_FPGA0_XA_LSSI_PARM, &dataaddr, 4);
+    IODelay(1);
+    return r;
+}
+
+// rtl8xxxu_init_phy_regs: returns number of failed writes
+uint32_t RtlWifiDriver::initPhyRegs(const RtlReg32Val *tbl, unsigned int len) {
+    uint32_t errors = 0;
+    for (unsigned int i = 0; i < len; i++) {
+        uint32_t v = tbl[i].val;
+        if (writeReg(tbl[i].reg, &v, 4) != kIOReturnSuccess) errors++;
+        IODelay(1);
+    }
+    return errors;
+}
+
+// rtl8188fu_init_phy_bb
+IOReturn RtlWifiDriver::initPhyBb() {
+    uint16_t v16 = rd16(REG_SYS_FUNC);
+    v16 |= BIT(1) | BIT(0) | BIT(13);          // BB_GLB_RSTN | BBRSTB | DIO_RF
+    wr16(REG_SYS_FUNC, v16);
+
+    wr8(REG_RF_CTRL, BIT(0) | BIT(1) | BIT(2)); // RF_ENABLE | RF_RSTB | RF_SDMRSTB
+    IODelay(20);
+
+    writeRfReg(0x01, 0x780);                   // RF6052_REG_IQADJ_G1
+
+    wr8(REG_SYS_FUNC, BIT(1) | BIT(0) | BIT(2) | BIT(4)); // BB_GLB_RSTN | BBRSTB | USBA | USBD
+
+    uint32_t e1 = initPhyRegs(kRtl8188fPhyTable, kRtl8188fPhyTableLen);
+    uint32_t e2 = initPhyRegs(kRtl8188fAgcTable, kRtl8188fAgcTableLen);
+    setProperty("phy-table-write-errors", (uint64_t)e1, 32);
+    setProperty("agc-table-write-errors", (uint64_t)e2, 32);
+    setProperty("bb-0x800-readback", (uint64_t)rd32(0x0800), 32);
+    return (e1 || e2) ? kIOReturnIOError : kIOReturnSuccess;
+}
+
+// rtl8188fu_init_phy_rf -> rtl8xxxu_init_phy_rf (RF path A)
+IOReturn RtlWifiDriver::initPhyRf() {
+    uint16_t rfsiRfenv = rd16(REG_FPGA0_XAB_RF_SW_CTRL) & BIT(4);   // FPGA0_RF_RFENV
+
+    uint32_t v = rd32(REG_FPGA0_XA_RF_INT_OE);
+    v |= BIT(20);
+    wr32(REG_FPGA0_XA_RF_INT_OE, v);
+    IODelay(1);
+    v = rd32(REG_FPGA0_XA_RF_INT_OE);
+    v |= BIT(4);
+    wr32(REG_FPGA0_XA_RF_INT_OE, v);
+    IODelay(1);
+
+    v = rd32(REG_FPGA0_XA_HSSI_PARM2);
+    v &= ~0x400u;                              // FPGA0_HSSI_3WIRE_ADDR_LEN
+    wr32(REG_FPGA0_XA_HSSI_PARM2, v);
+    IODelay(1);
+    v = rd32(REG_FPGA0_XA_HSSI_PARM2);
+    v &= ~0x800u;                              // FPGA0_HSSI_3WIRE_DATA_LEN
+    wr32(REG_FPGA0_XA_HSSI_PARM2, v);
+    IODelay(1);
+
+    const RtlRfRegVal *tbl = (fChipCut == 1) ? kRtl8188fRadioCutB : kRtl8188fRadioA;
+    unsigned int len = (fChipCut == 1) ? kRtl8188fRadioCutBLen : kRtl8188fRadioALen;
+    uint32_t errors = 0;
+
+    for (unsigned int i = 0; i < len; i++) {
+        uint8_t reg = tbl[i].reg;
+        switch (reg) {
+        case 0xfe: IOSleep(50); continue;
+        case 0xfd: IOSleep(5);  continue;
+        case 0xfc: IOSleep(1);  continue;
+        case 0xfb: IODelay(50); continue;
+        case 0xfa: IODelay(5);  continue;
+        case 0xf9: IODelay(1);  continue;
+        }
+        if (writeRfReg(reg, tbl[i].val) != kIOReturnSuccess) errors++;
+        IODelay(1);
+    }
+
+    uint16_t v16 = rd16(REG_FPGA0_XAB_RF_SW_CTRL);
+    v16 &= ~BIT(4);
+    v16 |= rfsiRfenv;
+    wr16(REG_FPGA0_XAB_RF_SW_CTRL, v16);
+
+    setProperty("rf-table-cut", (uint64_t)fChipCut, 8);
+    setProperty("rf-table-write-errors", (uint64_t)errors, 32);
+    return errors ? kIOReturnIOError : kIOReturnSuccess;
+}
+
+// rest of rtl8xxxu_init_device after init_phy_rf, up to usb_quirks (the !macpower branch for the 8188F)
+IOReturn RtlWifiDriver::postRfInit() {
+    wr32(0x0804, 0x00000003);                  // REG_FPGA0_TX_INFO
+
+    uint32_t v = BIT(5) | BIT(6) | BIT(8) | BIT(9) | ((BIT(8) | BIT(9)) << 16);
+    v |= BIT(10) | (BIT(10) << 16);            // PAPE (priv->no_pape assumed 0)
+    wr32(REG_FPGA0_XAB_RF_SW_CTRL, v);
+
+    wr32(REG_FPGA0_XA_RF_INT_OE, 0x66f60210);
+
+    uint8_t b = TX_TOTAL_PAGE_NUM + 1;         // TX buffer boundary
+    wr8(0x0424, b);                            // REG_TXPKTBUF_BCNQ_BDNY
+    wr8(0x0425, b);                            // REG_TXPKTBUF_MGQ_BDNY
+    wr8(0x045d, b);                            // REG_TXPKTBUF_WMAC_LBK_BF_HD
+    wr8(REG_TRXFF_BNDY, b);
+    wr8(0x0209, b);                            // REG_TDECTRL + 1
+
+    wr8(REG_PBP, (2 << 0) | (2 << 4));         // PBP_PAGE_SIZE_256 for RX and TX
+
+    // rtl8xxxu_auto_llt_table
+    uint32_t v32 = rd32(REG_AUTO_LLT);
+    v32 |= BIT(16);                            // AUTO_LLT_INIT_LLT
+    wr32(REG_AUTO_LLT, v32);
+    int i;
+    for (i = 500; i; i--) {
+        v32 = rd32(REG_AUTO_LLT);
+        if (!(v32 & BIT(16))) break;
+        IODelay(3);
+    }
+    IOReturn llt = i ? kIOReturnSuccess : kIOReturnTimeout;
+    setProperty("auto-llt-status", (uint64_t)(uint32_t)llt, 32);
+
+    // rtl8188f_usb_quirks
+    uint16_t cr = rd16(REG_CR);
+    cr |= BIT(6) | BIT(7);                     // CR_MAC_TX_ENABLE | CR_MAC_RX_ENABLE
+    wr16(REG_CR, cr);
+    v32 = rd32(REG_TXDMA_OFFSET_CHK);
+    v32 |= BIT(9);                             // TXDMA_OFFSET_DROP_DATA_EN
+    wr32(REG_TXDMA_OFFSET_CHK, v32);
+
+    setProperty("fpga0-tx-info-readback", (uint64_t)rd32(0x0804), 32);
+    setProperty("txpktbuf-bcnq-bdny-readback", (uint64_t)rd8(0x0424), 8);
+    setProperty("pbp-readback", (uint64_t)rd8(REG_PBP), 8);
+    setProperty("cr-readback", (uint64_t)rd16(REG_CR), 16);
+    setProperty("txdma-offset-chk-readback", (uint64_t)rd32(REG_TXDMA_OFFSET_CHK), 32);
+    return llt;
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -427,7 +577,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v8");
+    setProperty("build-tag", "v9");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -440,7 +590,10 @@ bool RtlWifiDriver::start(IOService *provider) {
     setProperty("pipe-out-0x02", fPipeOut2 ? kOSBooleanTrue : kOSBooleanFalse);
     setProperty("pipe-out-0x03", fPipeOut3 ? kOSBooleanTrue : kOSBooleanFalse);
 
-    setProperty("sys-cfg", (uint64_t)rd32(0x00F0), 32);
+    uint32_t sysCfg = rd32(0x00F0);
+    fChipCut = (uint8_t)((sysCfg & 0xf000) >> 12);   // SYS_CFG_CHIP_VERSION_MASK
+    setProperty("sys-cfg", (uint64_t)sysCfg, 32);
+    setProperty("chip-cut", (uint64_t)fChipCut, 8);
 
     IOReturn r = powerOn();
     setProperty("power-on-status", (uint64_t)(uint32_t)r, 32);
@@ -472,6 +625,18 @@ bool RtlWifiDriver::start(IOService *provider) {
     if (r == kIOReturnSuccess) {
         r = initMac();
         setProperty("init-mac-status", (uint64_t)(uint32_t)r, 32);
+        if (r == kIOReturnSuccess) {
+            r = initPhyBb();
+            setProperty("init-phy-bb-status", (uint64_t)(uint32_t)r, 32);
+            if (r == kIOReturnSuccess) {
+                r = initPhyRf();
+                setProperty("init-phy-rf-status", (uint64_t)(uint32_t)r, 32);
+                if (r == kIOReturnSuccess) {
+                    r = postRfInit();
+                    setProperty("post-rf-init-status", (uint64_t)(uint32_t)r, 32);
+                }
+            }
+        }
     }
 
     r = readEfuse();
@@ -487,7 +652,18 @@ bool RtlWifiDriver::start(IOService *provider) {
     return true;
 }
 
+bool RtlWifiDriver::willTerminate(IOService *provider, IOOptionBits options) {
+    setProperty("will-terminate", (uint64_t)options, 32);
+    return super::willTerminate(provider, options);
+}
+
+bool RtlWifiDriver::didTerminate(IOService *provider, IOOptionBits options, bool *defer) {
+    setProperty("did-terminate", (uint64_t)options, 32);
+    return super::didTerminate(provider, options, defer);
+}
+
 void RtlWifiDriver::stop(IOService *provider) {
+    setProperty("stop-called", kOSBooleanTrue);
     if (fPipeIn)   { fPipeIn->release();   fPipeIn = nullptr; }
     if (fPipeOut2) { fPipeOut2->release(); fPipeOut2 = nullptr; }
     if (fPipeOut3) { fPipeOut3->release(); fPipeOut3 = nullptr; }
