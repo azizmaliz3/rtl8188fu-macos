@@ -540,6 +540,7 @@ IOReturn RtlWifiDriver::postRfInit() {
     wr8(0x0209, b);                            // REG_TDECTRL + 1
 
     wr8(REG_PBP, (2 << 0) | (2 << 4));         // PBP_PAGE_SIZE_256 for RX and TX
+    setProperty("pbp-after-write", (uint64_t)rd8(REG_PBP), 8);
 
     // rtl8xxxu_auto_llt_table
     uint32_t v32 = rd32(REG_AUTO_LLT);
@@ -552,6 +553,7 @@ IOReturn RtlWifiDriver::postRfInit() {
         IODelay(3);
     }
     IOReturn llt = i ? kIOReturnSuccess : kIOReturnTimeout;
+    setProperty("pbp-after-llt", (uint64_t)rd8(REG_PBP), 8);
     setProperty("auto-llt-status", (uint64_t)(uint32_t)llt, 32);
 
     // rtl8188f_usb_quirks
@@ -570,6 +572,109 @@ IOReturn RtlWifiDriver::postRfInit() {
     return llt;
 }
 
+// rest of rtl8xxxu_init_device after init_phy_rf/usb_quirks for the 8188F, up to (not including)
+// calibration: TX report, RX/interrupt/WMAC setup, rate/SIFS/retry/EDCA, beacon, lifetimes, CCK/OFDM, CAM
+IOReturn RtlWifiDriver::initMacTail() {
+    uint32_t errs = 0;
+#define W(reg, len, val) do { uint32_t _v = (uint32_t)(val); \
+        if (writeReg((reg), &_v, (len)) != kIOReturnSuccess) errs++; } while (0)
+
+    // TX report (has_tx_report)
+    uint8_t v8 = rd8(0x04ec);
+    v8 |= BIT(1);                              // TX_REPORT_CTRL_TIMER_ENABLE
+    W(0x04ec, 1, v8);
+    W(0x04ed, 1, 0x02);                        // max RPT MACID
+    W(0x04f0, 2, 0xcdf0);                      // TX report timer, unit 32us
+    v8 = rd8(0x00a3) & 0xf8;
+    W(0x00a3, 1, v8);
+
+    W(0x060f, 1, 4);                           // REG_RX_DRVINFO_SZ
+    W(0x00b4, 4, 0xffffffff);                  // REG_HISR0
+    W(0x00bc, 4, 0xffffffff);                  // REG_HISR1
+
+    // WMAC: RCR and RX filter maps
+    uint32_t rcr = BIT(1) | BIT(2) | BIT(3) | BIT(13) | BIT(14) | BIT(28) | BIT(29) | BIT(30);
+    W(0x0608, 4, rcr);
+    W(0x06a4, 2, 0xffff);                      // RXFLTMAP2: all data frames
+    W(0x06a2, 2, 0x0400);                      // RXFLTMAP1
+    W(0x06a0, 2, 0xffff);                      // RXFLTMAP0: all management frames
+
+    // adaptive controls
+    uint32_t v32 = rd32(0x0440);               // REG_RESPONSE_RATE_SET
+    v32 &= ~0xfffffu;
+    v32 |= 0xffff1;
+    W(0x0440, 4, v32);
+    W(0x0428, 2, (0x10 << 0) | (0x10 << 8));   // spec SIFS (cck 0x10, ofdm 0x10)
+    W(0x042a, 2, (0x30 << 8) | 0x30);          // retry limit short/long = 0x30
+    W(0x0428, 2, (0x0a << 0) | (0x10 << 8));   // spec SIFS (cck 0x0a, ofdm 0x10)
+
+    // EDCA
+    W(0x063a, 2, 0x100a);                      // MAC_SPEC_SIFS
+    W(0x0514, 2, 0x100a);                      // SIFS_CCK
+    W(0x0516, 2, 0x100a);                      // SIFS_OFDM
+    W(0x0508, 4, 0x005ea42b);                  // EDCA BE
+    W(0x050c, 4, 0x0000a44f);                  // EDCA BK
+    W(0x0504, 4, 0x005ea324);                  // EDCA VI
+    W(0x0500, 4, 0x002fa226);                  // EDCA VO
+
+    // data auto rate fallback retry counts
+    W(0x0430, 4, 0x00000000);
+    W(0x0434, 4, 0x10080404);
+    W(0x0438, 4, 0x04030201);
+    W(0x043c, 4, 0x08070605);
+
+    v8 = rd8(0x0420);                          // REG_FWHW_TXQ_CTRL
+    v8 |= BIT(7);                              // AMPDU_RETRY
+    W(0x0420, 1, v8);
+    W(0x0640, 1, 0x40);                        // ACK timeout
+
+    // beacon parameters
+    W(0x0550, 2, BIT(4) | (BIT(4) << 8));      // BEACON_CTRL: disable TSF update
+    W(0x0540, 2, 0x6404);                      // TBTT_PROHIBIT
+    W(0x0559, 1, 2);                           // BEACON_DMA_TIME
+    W(0x0510, 2, 0x660F);                      // BEACON_TCFG
+
+    // packet lifetime (init_reg_pkt_life_time)
+    W(0x04c0, 2, 0x0400);
+    W(0x04c2, 2, 0x0400);
+
+    // CCK + OFDM blocks, CAM invalidate
+    v32 = rd32(0x0800);                        // REG_FPGA0_RF_MODE
+    v32 |= BIT(24) | BIT(25);
+    W(0x0800, 4, v32);
+    W(0x0670, 4, BIT(31) | BIT(30));           // CAM_CMD_POLLING | undocumented bit 30
+
+    W(0x0423, 1, 0xff);                        // HWSEQ_CTRL
+    W(0x04cc, 4, 0x0201ffff);                  // BAR_MODE_CTRL
+
+    v8 = rd8(0x0040);                          // GPIO_MUXCFG (8188F/8188E/8192F branch)
+    v8 &= ~BIT(5);
+    W(0x0040, 1, v8);
+    W(0x0a0a, 1, 0x83);                        // CCK PD threshold (8188F)
+
+    W(0x0652, 1, (30000 + 128 - 1) / 128);     // NAV_UPPER = 30000us, unit 128us
+
+    v32 = rd32(0x0420);                        // ack for xmit mgmt frames
+    v32 |= BIT(12);
+    W(0x0420, 4, v32);
+
+#undef W
+    setProperty("mac-tail-write-errors", (uint64_t)errs, 32);
+    setProperty("rcr-readback", (uint64_t)rd32(0x0608), 32);
+    setProperty("rxfltmap0-readback", (uint64_t)rd16(0x06a0), 16);
+    setProperty("resp-rate-readback", (uint64_t)rd32(0x0440), 32);
+    setProperty("spec-sifs-readback", (uint64_t)rd16(0x0428), 16);
+    setProperty("retry-limit-readback", (uint64_t)rd16(0x042a), 16);
+    setProperty("edca-be-readback", (uint64_t)rd32(0x0508), 32);
+    setProperty("rf-mode-readback", (uint64_t)rd32(0x0800), 32);
+    setProperty("nav-upper-readback", (uint64_t)rd8(0x0652), 8);
+    setProperty("cck-pd-readback", (uint64_t)rd8(0x0a0a), 8);
+    setProperty("txrpt-time-readback", (uint64_t)rd16(0x04f0), 16);
+    setProperty("beacon-tcfg-readback", (uint64_t)rd16(0x0510), 16);
+    setProperty("bar-mode-readback", (uint64_t)rd32(0x04cc), 32);
+    return errs ? kIOReturnIOError : kIOReturnSuccess;
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -577,7 +682,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v9");
+    setProperty("build-tag", "v10");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -634,6 +739,10 @@ bool RtlWifiDriver::start(IOService *provider) {
                 if (r == kIOReturnSuccess) {
                     r = postRfInit();
                     setProperty("post-rf-init-status", (uint64_t)(uint32_t)r, 32);
+                    if (r == kIOReturnSuccess) {
+                        r = initMacTail();
+                        setProperty("mac-tail-status", (uint64_t)(uint32_t)r, 32);
+                    }
                 }
             }
         }
