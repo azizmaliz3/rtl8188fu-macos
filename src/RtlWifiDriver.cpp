@@ -703,41 +703,8 @@ IOReturn RtlWifiDriver::initCalib() {
 #define W(reg, len, val) do { uint32_t _v = (uint32_t)(val); \
         if (writeReg((reg), &_v, (len)) != kIOReturnSuccess) errs++; } while (0)
 
-    // rtl8188f_set_tx_power(channel 1, 20MHz); efuse layout of the 8188FU
-    uint8_t cckIdx[6], ht40Idx[5];
-    for (int i = 0; i < 6; i++) {
-        cckIdx[i] = fEfuse[0x10 + i];
-        if (cckIdx[i] > 0x3F) cckIdx[i] = 0x22;       // TX_POWER_INDEX_DEFAULT_CCK
-    }
-    for (int i = 0; i < 5; i++) {
-        ht40Idx[i] = fEfuse[0x16 + i];
-        if (ht40Idx[i] > 0x3F) ht40Idx[i] = 0x27;     // TX_POWER_INDEX_DEFAULT_HT40
-    }
-    int8_t ofdmDiff = (int8_t)(fEfuse[0x1b] & 0x0f);  // signed 4-bit fields
-    if (ofdmDiff & 0x08) ofdmDiff |= 0xf0;
-    int8_t ht20Diff = (int8_t)((fEfuse[0x1b] >> 4) & 0x0f);
-    if (ht20Diff & 0x08) ht20Diff |= 0xf0;
-
-    uint8_t cck = cckIdx[0];                           // channel 1: group 0, cck group 0
-    uint32_t v32 = rd32(0x0e08);
-    v32 &= 0xffff00ff;
-    v32 |= ((uint32_t)cck << 8);
-    W(0x0e08, 4, v32);
-    v32 = rd32(0x086c);
-    v32 &= 0xff;
-    v32 |= (((uint32_t)cck << 8) | ((uint32_t)cck << 16) | ((uint32_t)cck << 24));
-    W(0x086c, 4, v32);
-
-    uint8_t ofdmBase = (uint8_t)(ht40Idx[0] + ofdmDiff);
-    uint32_t ofdm = ofdmBase * 0x01010101u;
-    W(0x0e00, 4, ofdm);
-    W(0x0e04, 4, ofdm);
-    uint8_t mcsBase = (uint8_t)(ht40Idx[0] + ht20Diff);
-    uint32_t mcs = mcsBase * 0x01010101u;
-    W(0x0e10, 4, mcs);
-    W(0x0e14, 4, mcs);
-    W(0x0e18, 4, mcs);
-    W(0x0e1c, 4, mcs);
+    setTxPower(1);                                     // channel 1, 20 MHz
+    uint32_t v32;
 
     // rtl8188f_phy_lc_calibrate
     uint32_t lstf = rd32(0x0d00);                      // REG_OFDM1_LSTF
@@ -826,6 +793,198 @@ IOReturn RtlWifiDriver::initCalib() {
     return errs ? kIOReturnIOError : kIOReturnSuccess;
 }
 
+// rtl8188f_set_tx_power for an HT20 channel; efuse layout of the 8188FU
+void RtlWifiDriver::setTxPower(uint8_t channel) {
+    uint8_t cckIdx[6], ht40Idx[5];
+    for (int i = 0; i < 6; i++) {
+        cckIdx[i] = fEfuse[0x10 + i];
+        if (cckIdx[i] > 0x3F) cckIdx[i] = 0x22;       // TX_POWER_INDEX_DEFAULT_CCK
+    }
+    for (int i = 0; i < 5; i++) {
+        ht40Idx[i] = fEfuse[0x16 + i];
+        if (ht40Idx[i] > 0x3F) ht40Idx[i] = 0x27;     // TX_POWER_INDEX_DEFAULT_HT40
+    }
+    int8_t ofdmDiff = (int8_t)(fEfuse[0x1b] & 0x0f);  // signed 4-bit fields
+    if (ofdmDiff & 0x08) ofdmDiff |= 0xf0;
+    int8_t ht20Diff = (int8_t)((fEfuse[0x1b] >> 4) & 0x0f);
+    if (ht20Diff & 0x08) ht20Diff |= 0xf0;
+
+    int group, cckGroup;                               // rtl8188f_channel_to_group
+    if (channel < 3) group = 0;
+    else if (channel < 6) group = 1;
+    else if (channel < 9) group = 2;
+    else if (channel < 12) group = 3;
+    else group = 4;
+    cckGroup = (channel == 14) ? 5 : group;
+
+    uint8_t cck = cckIdx[cckGroup];
+    uint32_t v32 = rd32(0x0e08);
+    v32 &= 0xffff00ff;
+    v32 |= ((uint32_t)cck << 8);
+    wr32(0x0e08, v32);
+    v32 = rd32(0x086c);
+    v32 &= 0xff;
+    v32 |= (((uint32_t)cck << 8) | ((uint32_t)cck << 16) | ((uint32_t)cck << 24));
+    wr32(0x086c, v32);
+
+    uint8_t ofdmBase = (uint8_t)(ht40Idx[group] + ofdmDiff);
+    uint32_t ofdm = ofdmBase * 0x01010101u;
+    wr32(0x0e00, ofdm);
+    wr32(0x0e04, ofdm);
+    uint8_t mcsBase = (uint8_t)(ht40Idx[group] + ht20Diff);
+    uint32_t mcs = mcsBase * 0x01010101u;
+    wr32(0x0e10, mcs);
+    wr32(0x0e14, mcs);
+    wr32(0x0e18, mcs);
+    wr32(0x0e1c, mcs);
+}
+
+// rtl8188f_spur_calibration
+void RtlWifiDriver::spurCalibration(uint8_t channel) {
+    static const uint32_t freq[15] = {0,0,0,0,0,0xFCCD,0xFC4D,0xFFCD,0xFF4D,0,0,0xFDCD,0,0xFCCD,0xFF9A};
+    static const uint32_t d40[15]  = {0,0,0,0,0,0x06000000,0x00000600,0,0,0,0,0,0,0x06000000,0};
+    static const uint32_t d44[15]  = {0,0,0,0,0,0,0,0,0,0,0,0x04000000,0,0,0};
+    static const uint32_t d4c[15]  = {0,0,0,0,0,0,0,0x06000000,0x00000380,0,0,0,0,0,0x00180000};
+    const uint8_t threshold = 0x16;
+    bool doNotch, hwCtrl, swCtrl, hwCtrlS1 = false, swCtrlS1 = false;
+    uint32_t v32, initialGain, reg948;
+
+    v32 = rd32(0x0c40);                                // REG_OFDM0_RX_D_SYNC_PATH
+    v32 |= 0x1f000000u;                                // GENMASK(28, 24)
+    wr32(0x0c40, v32);
+    v32 = rd32(0x0c40);                                // enable notch filter
+    v32 |= BIT(9);
+    wr32(0x0c40, v32);
+
+    if (channel <= 14 && freq[channel] > 0) {
+        reg948 = rd32(0x0948);                         // REG_S0S1_PATH_SWITCH
+        hwCtrl = reg948 & BIT(6);
+        swCtrl = !hwCtrl;
+        if (hwCtrl) {
+            v32 = rd32(0x0864);                        // REG_FPGA0_XB_RF_INT_OE
+            v32 &= 0x38;                               // GENMASK(5, 3)
+            hwCtrlS1 = (v32 == BIT(3));
+        } else if (swCtrl) {
+            swCtrlS1 = !(reg948 & BIT(9));
+        }
+        if (hwCtrlS1 || swCtrlS1) {
+            initialGain = rd32(0x0c50);                // REG_OFDM0_XA_AGC_CORE1
+            v32 = rd32(0x0800);                        // disable CCK block
+            v32 &= ~BIT(24);
+            wr32(0x0800, v32);
+            v32 = initialGain & ~0x7fu;                // OFDM0_X_AGC_CORE1_IGI_MASK
+            v32 |= 0x30;
+            wr32(0x0c50, v32);
+            wr32(0x088c, 0xccf000c0);                  // disable 3-wire
+            wr32(0x0808, freq[channel]);               // setup PSD
+            wr32(0x0808, 0x400000 | freq[channel]);    // start PSD
+            IOSleep(30);
+            doNotch = rd32(0x08b4) >= threshold;       // REG_FPGA0_PSD_REPORT
+            wr32(0x0808, freq[channel]);               // turn off PSD
+            wr32(0x088c, 0xccc000c0);                  // enable 3-wire
+            v32 = rd32(0x0800);                        // enable CCK block
+            v32 |= BIT(24);
+            wr32(0x0800, v32);
+            wr32(0x0c50, initialGain);
+            if (doNotch) {
+                wr32(0x0d40, d40[channel]);
+                wr32(0x0d44, d44[channel]);
+                wr32(0x0d48, 0x0);
+                wr32(0x0d4c, d4c[channel]);
+                v32 = rd32(0x0d2c);                    // enable CSI mask
+                v32 |= BIT(28);
+                wr32(0x0d2c, v32);
+                setProperty("spur-notch", kOSBooleanTrue);
+                return;
+            }
+        }
+    }
+    v32 = rd32(0x0d2c);                                // disable CSI mask function
+    v32 &= ~BIT(28);
+    wr32(0x0d2c, v32);
+    setProperty("spur-notch", kOSBooleanFalse);
+}
+
+// rtl8188fu_config_channel for a 20 MHz channel, followed by the TX power update
+IOReturn RtlWifiDriver::setChannel20(uint8_t channel) {
+    if (channel < 1 || channel > 14) return kIOReturnBadArgument;
+    uint32_t v32 = readRfReg(0x18);                    // RF6052_REG_MODE_AG
+    v32 &= ~0x3ffu;                                    // MODE_AG_CHANNEL_MASK
+    v32 |= channel;
+    writeRfReg(0x18, v32);
+
+    spurCalibration(channel);
+
+    v32 = rd32(0x0800);                                // bandwidth mode: 20 MHz
+    v32 &= ~BIT(0);
+    wr32(0x0800, v32);
+    v32 = rd32(0x0900);                                // REG_FPGA1_RF_MODE
+    v32 &= ~BIT(0);
+    wr32(0x0900, v32);
+
+    v32 = rd32(0x0800);                                // RXADC CLK
+    v32 |= 0x700;                                      // GENMASK(10, 8)
+    wr32(0x0800, v32);
+    v32 = rd32(0x0800);                                // TXDAC CLK
+    v32 |= BIT(14) | BIT(12);
+    v32 &= ~BIT(13);
+    wr32(0x0800, v32);
+
+    v32 = rd32(0x0ce4);                                // REG_OFDM0_TX_PSDO_NOISE_WEIGHT: small BW
+    v32 &= ~0xc0000000u;
+    wr32(0x0ce4, v32);
+    v32 = rd32(0x0ce4);                                // adc buffer clk
+    v32 &= ~BIT(29);
+    v32 |= BIT(28);
+    wr32(0x0ce4, v32);
+    v32 = rd32(0x0c10);                                // REG_OFDM0_XA_RX_AFE
+    v32 &= ~BIT(29);
+    v32 |= BIT(28);
+    wr32(0x0c10, v32);
+    v32 = rd32(0x0954);                                // REG_OFDM_RX_DFIR
+    v32 &= ~BIT(19);
+    wr32(0x0954, v32);
+    v32 = rd32(0x0954);
+    v32 &= ~0x00f00000u;                               // GENMASK(23, 20)
+    v32 |= BIT(21);
+    v32 |= BIT(20);                                    // 20 MHz
+    wr32(0x0954, v32);
+
+    v32 = channel | 0xc00;                             // RF TRX_BW: channel | MODE_AG_BW_20MHZ_8723B
+    writeRfReg(0x18, v32);
+    writeRfReg(0x87, 0x00065);                         // RXG_MIX_SWBW: filter BW for 20 MHz
+    writeRfReg(0x1c, 0x0);                             // RX_BB2
+    writeRfReg(0xdf, 0x00140);                         // GAIN_CCA: RC corner
+    writeRfReg(0x1b, 0x01c6c);                         // RX_G2
+
+    setTxPower(channel);
+    setProperty("channel-set", (uint64_t)channel, 8);
+    setProperty("rf-0x18-after-channel", (uint64_t)readRfReg(0x18), 32);
+    setProperty("tx-agc-ofdm-after-channel", (uint64_t)rd32(0x0e00), 32);
+    setProperty("rf-mode-after-channel", (uint64_t)rd32(0x0800), 32);
+    return kIOReturnSuccess;
+}
+
+// rtl8188fu_init_statistics
+void RtlWifiDriver::initStatistics() {
+    wr16(0x0894 + 2, 0xc350);                          // REG_NHM_TIMER_8723B + 2
+    wr16(0x0890 + 2, 0xffff);                          // REG_NHM_TH9_TH10_8723B + 2
+    wr32(0x0898, 0xffffff50);                          // REG_NHM_TH3_TO_TH0_8723B
+    wr32(0x089c, 0xffffffff);                          // REG_NHM_TH7_TO_TH4_8723B
+    uint32_t v32 = rd32(0x0e28);                       // REG_FPGA0_IQK, TH8
+    v32 |= 0xff;
+    wr32(0x0e28, v32);
+    v32 = rd32(0x0890);                                // enable CCK
+    v32 &= ~(BIT(8) | BIT(9) | BIT(10));
+    v32 |= BIT(8);
+    wr32(0x0890, v32);
+    v32 = rd32(0x0c0c);                                // max power amongst all RX antennas
+    v32 |= BIT(7);
+    wr32(0x0c0c, v32);
+    setProperty("nhm-th3-th0-readback", (uint64_t)rd32(0x0898), 32);
+    setProperty("fa-rstc-readback", (uint64_t)rd32(0x0c0c), 32);
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -833,7 +992,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v11");
+    setProperty("build-tag", "v12");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -916,6 +1075,11 @@ bool RtlWifiDriver::start(IOService *provider) {
     if (chainOk && efuseOk && rtlId == 0x8129) {
         r = initCalib();
         setProperty("calib-status", (uint64_t)(uint32_t)r, 32);
+        if (r == kIOReturnSuccess) {
+            initStatistics();
+            r = setChannel20(6);
+            setProperty("set-channel-status", (uint64_t)(uint32_t)r, 32);
+        }
     }
     return true;
 }

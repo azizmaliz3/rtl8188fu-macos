@@ -48,6 +48,10 @@ class RtlWifiDriver : public IOService {
     IOReturn initMacTail();
     uint32_t readRfReg(uint8_t reg);
     IOReturn initCalib();
+    void     setTxPower(uint8_t channel);
+    void     spurCalibration(uint8_t channel);
+    IOReturn setChannel20(uint8_t channel);
+    void     initStatistics();
 
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);
