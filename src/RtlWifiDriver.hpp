@@ -46,6 +46,8 @@ class RtlWifiDriver : public IOService {
     IOReturn initPhyRf();
     IOReturn postRfInit();
     IOReturn initMacTail();
+    uint32_t readRfReg(uint8_t reg);
+    IOReturn initCalib();
 
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);

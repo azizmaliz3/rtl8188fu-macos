@@ -675,6 +675,157 @@ IOReturn RtlWifiDriver::initMacTail() {
     return errs ? kIOReturnIOError : kIOReturnSuccess;
 }
 
+// rtl8xxxu_read_rfreg for RF path A
+uint32_t RtlWifiDriver::readRfReg(uint8_t reg) {
+    uint32_t hssia = rd32(REG_FPGA0_XA_HSSI_PARM2);
+    uint32_t v = hssia;
+    v &= ~0x7f800000u;                          // FPGA0_HSSI_PARM2_ADDR_MASK
+    v |= ((uint32_t)reg << 23);                 // ADDR_SHIFT
+    v |= BIT(31);                               // EDGE_READ
+    hssia &= ~BIT(31);
+    wr32(REG_FPGA0_XA_HSSI_PARM2, hssia);
+    IODelay(10);
+    wr32(REG_FPGA0_XA_HSSI_PARM2, v);
+    IODelay(100);
+    hssia |= BIT(31);
+    wr32(REG_FPGA0_XA_HSSI_PARM2, hssia);
+    IODelay(10);
+    uint32_t p = rd32(0x0820);                  // REG_FPGA0_XA_HSSI_PARM1
+    uint32_t ret = (p & BIT(8)) ? rd32(0x08b8)  // PI mode: HSPI readback
+                                : rd32(0x08a0); // LSSI readback
+    return ret & 0xfffff;
+}
+
+// Remaining init_device steps for the 8188F: TX power, LC calibration, thermal meter,
+// burst/aggregation, multicast filter, MAC address. IQ calibration is not included.
+IOReturn RtlWifiDriver::initCalib() {
+    uint32_t errs = 0;
+#define W(reg, len, val) do { uint32_t _v = (uint32_t)(val); \
+        if (writeReg((reg), &_v, (len)) != kIOReturnSuccess) errs++; } while (0)
+
+    // rtl8188f_set_tx_power(channel 1, 20MHz); efuse layout of the 8188FU
+    uint8_t cckIdx[6], ht40Idx[5];
+    for (int i = 0; i < 6; i++) {
+        cckIdx[i] = fEfuse[0x10 + i];
+        if (cckIdx[i] > 0x3F) cckIdx[i] = 0x22;       // TX_POWER_INDEX_DEFAULT_CCK
+    }
+    for (int i = 0; i < 5; i++) {
+        ht40Idx[i] = fEfuse[0x16 + i];
+        if (ht40Idx[i] > 0x3F) ht40Idx[i] = 0x27;     // TX_POWER_INDEX_DEFAULT_HT40
+    }
+    int8_t ofdmDiff = (int8_t)(fEfuse[0x1b] & 0x0f);  // signed 4-bit fields
+    if (ofdmDiff & 0x08) ofdmDiff |= 0xf0;
+    int8_t ht20Diff = (int8_t)((fEfuse[0x1b] >> 4) & 0x0f);
+    if (ht20Diff & 0x08) ht20Diff |= 0xf0;
+
+    uint8_t cck = cckIdx[0];                           // channel 1: group 0, cck group 0
+    uint32_t v32 = rd32(0x0e08);
+    v32 &= 0xffff00ff;
+    v32 |= ((uint32_t)cck << 8);
+    W(0x0e08, 4, v32);
+    v32 = rd32(0x086c);
+    v32 &= 0xff;
+    v32 |= (((uint32_t)cck << 8) | ((uint32_t)cck << 16) | ((uint32_t)cck << 24));
+    W(0x086c, 4, v32);
+
+    uint8_t ofdmBase = (uint8_t)(ht40Idx[0] + ofdmDiff);
+    uint32_t ofdm = ofdmBase * 0x01010101u;
+    W(0x0e00, 4, ofdm);
+    W(0x0e04, 4, ofdm);
+    uint8_t mcsBase = (uint8_t)(ht40Idx[0] + ht20Diff);
+    uint32_t mcs = mcsBase * 0x01010101u;
+    W(0x0e10, 4, mcs);
+    W(0x0e14, 4, mcs);
+    W(0x0e18, 4, mcs);
+    W(0x0e1c, 4, mcs);
+
+    // rtl8188f_phy_lc_calibrate
+    uint32_t lstf = rd32(0x0d00);                      // REG_OFDM1_LSTF
+    if (lstf & 0x70000000u) W(0x0d00, 4, lstf & ~0x70000000u);
+    else W(0x0522, 1, 0xff);                           // REG_TXPAUSE: block all queues
+    uint32_t rfAmode = readRfReg(0x18);                // RF6052_REG_MODE_AG
+    writeRfReg(0x18, rfAmode | 0x08000);
+    int i;
+    for (i = 0; i < 100; i++) {
+        if ((readRfReg(0x18) & 0x08000) == 0) break;
+        IOSleep(10);
+    }
+    writeRfReg(0x18, rfAmode);
+    if (lstf & 0x70000000u) W(0x0d00, 4, lstf);
+    else W(0x0522, 1, 0x00);
+    setProperty("lc-cal-loops", (uint64_t)i, 32);      // 100 = timed out
+    setProperty("rf-0x18-before-cal", (uint64_t)rfAmode, 32);
+
+    // thermal meter (gen2, 8188F)
+    v32 = readRfReg(0x42);                             // RF6052_REG_T_METER_8723B
+    v32 |= 0x30000;
+    writeRfReg(0x42, v32);
+
+    // rtl8xxxu_init_burst
+    uint8_t v8 = rd8(0x0290);                          // REG_RXDMA_PRO_8723B
+    v8 = (uint8_t)((v8 & ~0x3c) | (1 << 4) | (3 << 2) | BIT(1));
+    W(0x0290, 1, v8);
+    v8 = rd8(0x04c7);                                  // REG_HT_SINGLE_AMPDU_8723B
+    v8 |= BIT(7);
+    W(0x04c7, 1, v8);
+    W(0x04ca, 2, 0x0c14);                              // REG_MAX_AGGR_NUM
+    W(0x0456, 1, 0x70);                                // REG_AMPDU_MAX_TIME_8723B
+    W(0x0458, 4, 0xffffffff);                          // REG_AGGLEN_LMT
+    W(0x060c, 1, 0x18);                                // REG_RX_PKT_LIMIT
+    W(0x0512, 1, 0x00);                                // REG_PIFS
+    W(0x0420, 1, BIT(7));                              // FWHW_TXQ_CTRL_AMPDU_RETRY
+    W(0x0460, 4, 0x03086666);                          // REG_FAST_EDCA_CTRL
+    W(0x055c, 1, 0x28);                                // REG_USTIME_TSF_8723B
+    W(0x0638, 1, 0x28);                                // REG_USTIME_EDCA
+    v8 = rd8(REG_RSV_CTRL);
+    v8 |= BIT(5) | BIT(6);                             // WLOCK_1C | DIS_PRST
+    W(REG_RSV_CTRL, 1, v8);
+
+    // rtl8188fu_init_aggregation
+    v32 = rd32(0x0208);                                // REG_DWBCN0_CTRL_8188F
+    v32 &= ~(0xfu << 4);
+    v32 |= (6u << 4);
+    W(0x0208, 4, v32);
+    W(0x0228, 1, 6 << 1);                              // REG_DWBCN1_CTRL_8723B
+    uint8_t aggCtrl = rd8(REG_TRXDMA_CTRL);
+    aggCtrl &= ~BIT(2);                                // TRXDMA_CTRL_RXDMA_AGG_EN
+    uint32_t aggRx = rd32(0x0280);                     // REG_RXDMA_AGG_PG_TH
+    aggRx &= ~BIT(31);
+    aggRx &= ~0xFF0Fu;
+    uint8_t rxdmaMode = rd8(0x0290);
+    rxdmaMode &= ~BIT(1);
+    W(REG_TRXDMA_CTRL, 1, aggCtrl);
+    W(0x0280, 4, aggRx);
+    W(0x0290, 1, rxdmaMode);
+
+    // the reference sets XMIT_MGMT_ACK after the burst step; the write above cleared it
+    v32 = rd32(0x0420);
+    v32 |= BIT(12);
+    W(0x0420, 4, v32);
+
+    // multicast filter (init_reg_rxfltmap) and MAC address
+    W(0x0620, 4, 0xffffffff);                          // REG_MAR
+    W(0x0624, 4, 0xffffffff);
+    for (int k = 0; k < 6; k++) W(0x0610 + k, 1, fEfuse[0xd7 + k]);   // REG_MACID
+
+#undef W
+    setProperty("calib-write-errors", (uint64_t)errs, 32);
+    setProperty("tx-agc-ofdm-readback", (uint64_t)rd32(0x0e00), 32);
+    setProperty("tx-agc-mcs-readback", (uint64_t)rd32(0x0e10), 32);
+    setProperty("tx-agc-cck-readback", (uint64_t)rd32(0x0e08), 32);
+    setProperty("rf-0x42-readback", (uint64_t)readRfReg(0x42), 32);
+    setProperty("rf-0x01-readback", (uint64_t)readRfReg(0x01), 32);
+    setProperty("rxdma-pro-readback", (uint64_t)rd8(0x0290), 8);
+    setProperty("max-aggr-num-readback", (uint64_t)rd16(0x04ca), 16);
+    setProperty("fwhw-txq-ctrl-readback", (uint64_t)rd32(0x0420), 32);
+    setProperty("dwbcn0-ctrl-readback", (uint64_t)rd32(0x0208), 32);
+    char mid[20];
+    snprintf(mid, sizeof(mid), "%02x:%02x:%02x:%02x:%02x:%02x",
+             rd8(0x0610), rd8(0x0611), rd8(0x0612), rd8(0x0613), rd8(0x0614), rd8(0x0615));
+    setProperty("macid-readback-str", mid);
+    return errs ? kIOReturnIOError : kIOReturnSuccess;
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -682,7 +833,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v10");
+    setProperty("build-tag", "v11");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -700,6 +851,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     setProperty("sys-cfg", (uint64_t)sysCfg, 32);
     setProperty("chip-cut", (uint64_t)fChipCut, 8);
 
+    bool chainOk = false;
     IOReturn r = powerOn();
     setProperty("power-on-status", (uint64_t)(uint32_t)r, 32);
     setProperty("fsmco-after-power-on", (uint64_t)rd32(REG_APS_FSMCO), 32);
@@ -742,6 +894,7 @@ bool RtlWifiDriver::start(IOService *provider) {
                     if (r == kIOReturnSuccess) {
                         r = initMacTail();
                         setProperty("mac-tail-status", (uint64_t)(uint32_t)r, 32);
+                        chainOk = (r == kIOReturnSuccess);
                     }
                 }
             }
@@ -749,6 +902,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     }
 
     r = readEfuse();
+    bool efuseOk = (r == kIOReturnSuccess);
     setProperty("efuse-status", (uint64_t)(uint32_t)r, 32);
     setProperty("efuse-map", fEfuse, sizeof(fEfuse));
     uint16_t rtlId = (uint16_t)(fEfuse[0] | (fEfuse[1] << 8));
@@ -758,6 +912,11 @@ bool RtlWifiDriver::start(IOService *provider) {
              fEfuse[0xd7], fEfuse[0xd8], fEfuse[0xd9],
              fEfuse[0xda], fEfuse[0xdb], fEfuse[0xdc]);
     setProperty("mac-address-str", mac);
+
+    if (chainOk && efuseOk && rtlId == 0x8129) {
+        r = initCalib();
+        setProperty("calib-status", (uint64_t)(uint32_t)r, 32);
+    }
     return true;
 }
 
