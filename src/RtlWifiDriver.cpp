@@ -997,7 +997,8 @@ void RtlWifiDriver::rxProbe(uint8_t channel) {
     uint8_t *buf = (uint8_t *)md->getBytesNoCopy();
     uint32_t ok = 0, timeouts = 0, other = 0, beacons = 0, mgmt = 0, crcErr = 0;
     uint32_t lastErr = 0;
-    bool haveFirst = false, haveSsid = false;
+    bool haveFirst = false, haveSsid = false, haveProbeSsid = false;
+    uint32_t probeResp = 0;
     char key[48];
 
     for (int n = 0; n < 15; n++) {
@@ -1050,8 +1051,27 @@ void RtlWifiDriver::rxProbe(uint8_t channel) {
                 }
             }
         }
+        if (!crc && off + 36 <= got && buf[off] == 0x50) {      // probe response
+            probeResp++;
+            if (!haveProbeSsid) {
+                uint32_t ie = off + 24 + 12;
+                if (ie + 2 <= got && buf[ie] == 0 && buf[ie + 1] <= 32 && ie + 2 + buf[ie + 1] <= got) {
+                    char ssid[33];
+                    uint8_t len = buf[ie + 1];
+                    for (uint8_t i = 0; i < len; i++) {
+                        uint8_t ch = buf[ie + 2 + i];
+                        ssid[i] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+                    }
+                    ssid[len] = 0;
+                    snprintf(key, sizeof(key), "rx-ch%d-probe-ssid", channel);
+                    setProperty(key, ssid);
+                    haveProbeSsid = true;
+                }
+            }
+        }
     }
     md->release();
+    snprintf(key, sizeof(key), "rx-ch%d-proberesp", channel); setProperty(key, (uint64_t)probeResp, 32);
 
     snprintf(key, sizeof(key), "rx-ch%d-ok", channel);        setProperty(key, (uint64_t)ok, 32);
     snprintf(key, sizeof(key), "rx-ch%d-timeouts", channel);  setProperty(key, (uint64_t)timeouts, 32);
@@ -1062,6 +1082,52 @@ void RtlWifiDriver::rxProbe(uint8_t channel) {
     snprintf(key, sizeof(key), "rx-ch%d-crc-err", channel);   setProperty(key, (uint64_t)crcErr, 32);
 }
 
+// Broadcast probe request on the current channel through bulk-OUT 0x02 (management queue).
+// 40-byte TX descriptor (rtl8xxxu_txdesc40) followed by a 32-byte 802.11 frame.
+IOReturn RtlWifiDriver::txProbeRequest(uint8_t channel) {
+    if (!fPipeOut2) return kIOReturnBadArgument;
+    uint8_t pkt[72];
+    memset(pkt, 0, sizeof(pkt));
+    uint8_t *d = pkt;
+    uint8_t *f = pkt + 40;
+
+    // 802.11 probe request: wildcard SSID, rates 1/2/5.5/11 Mbps
+    f[0] = 0x40; f[1] = 0x00;                       // frame control: management, probe request
+    memset(f + 4, 0xff, 6);                         // DA
+    memcpy(f + 10, &fEfuse[0xd7], 6);               // SA = adapter MAC
+    memset(f + 16, 0xff, 6);                        // BSSID
+    f[24] = 0x00; f[25] = 0x00;                     // SSID IE, length 0
+    f[26] = 0x01; f[27] = 0x04;                     // supported rates IE
+    f[28] = 0x82; f[29] = 0x84; f[30] = 0x8b; f[31] = 0x96;
+
+    // TX descriptor (little-endian words)
+    d[0] = 32; d[1] = 0;                            // pkt_size
+    d[2] = 40;                                      // pkt_offset = descriptor size
+    d[3] = 0x80 | 0x08 | 0x04 | 0x01;               // OWN | FIRST | LAST | BROADMULTICAST
+    uint32_t w;
+    w = (0x12u << 8);              memcpy(d + 4,  &w, 4);   // txdw1: queue = MGNT, macid 0
+    w = BIT(16);                   memcpy(d + 8,  &w, 4);   // txdw2: AGG_BREAK
+    w = BIT(8);                    memcpy(d + 12, &w, 4);   // txdw3: USE_DRIVER_RATE
+    w = (6u << 18) | BIT(17);      memcpy(d + 16, &w, 4);   // txdw4: rate 1M, retry limit 6 enabled
+    w = BIT(15);                   memcpy(d + 32, &w, 4);   // txdw8: HW_SEQ_ENABLE
+    uint16_t csum = 0;                                      // XOR of the first 16 words, csum field zero
+    for (int i = 0; i < 16; i++) csum ^= (uint16_t)(d[2 * i] | (d[2 * i + 1] << 8));
+    d[28] = csum & 0xff; d[29] = csum >> 8;
+
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionOut, sizeof(pkt), 1);
+    if (!md) return kIOReturnNoMemory;
+    memcpy(md->getBytesNoCopy(), pkt, sizeof(pkt));
+    uint32_t got = 0;
+    IOReturn r = fPipeOut2->io(md, sizeof(pkt), got, 500);
+    md->release();
+
+    char key[48];
+    snprintf(key, sizeof(key), "tx-ch%d-status", channel); setProperty(key, (uint64_t)(uint32_t)r, 32);
+    snprintf(key, sizeof(key), "tx-ch%d-bytes", channel);  setProperty(key, (uint64_t)got, 32);
+    snprintf(key, sizeof(key), "tx-ch%d-csum", channel);   setProperty(key, (uint64_t)csum, 16);
+    return r;
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -1069,7 +1135,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v13");
+    setProperty("build-tag", "v14");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1159,7 +1225,11 @@ bool RtlWifiDriver::start(IOService *provider) {
             if (r == kIOReturnSuccess) {
                 static const uint8_t kProbeCh[] = {1, 6, 11};
                 for (unsigned k = 0; k < sizeof(kProbeCh); k++) {
-                    if (setChannel20(kProbeCh[k]) == kIOReturnSuccess) rxProbe(kProbeCh[k]);
+                    if (setChannel20(kProbeCh[k]) == kIOReturnSuccess) {
+                        if (kProbeCh[k] != 11)
+                            for (int t = 0; t < 3; t++) { txProbeRequest(kProbeCh[k]); IOSleep(10); }
+                        rxProbe(kProbeCh[k]);
+                    }
                 }
             }
         }
