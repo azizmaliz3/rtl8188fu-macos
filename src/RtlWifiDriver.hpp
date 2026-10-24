@@ -52,6 +52,7 @@ class RtlWifiDriver : public IOService {
     void     spurCalibration(uint8_t channel);
     IOReturn setChannel20(uint8_t channel);
     void     initStatistics();
+    void     rxProbe(uint8_t channel);
 
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);

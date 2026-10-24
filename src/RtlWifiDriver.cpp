@@ -3,6 +3,7 @@
 #include "RtlWifiTables.h"         // generated: kRtl8188fMacTable[]
 #include "RtlWifiPhyTables.h"      // generated: PHY, AGC and RF tables
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
 
 #define super IOService
@@ -985,6 +986,82 @@ void RtlWifiDriver::initStatistics() {
     setProperty("fa-rstc-readback", (uint64_t)rd32(0x0c0c), 32);
 }
 
+// First receive test: synchronous bulk-IN reads on the current channel. Decodes the 24-byte RX descriptor
+// (rtl8xxxu_rxdesc24: dword0 = pktlen[13:0], crc32[14], icverr[15], drvinfo_sz[19:16], shift[25:24])
+// and reports counts, the first frame bytes and the SSID of the first beacon as properties.
+void RtlWifiDriver::rxProbe(uint8_t channel) {
+    if (!fPipeIn) return;
+    const uint32_t kBuf = 16384;
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionIn, kBuf, 1);
+    if (!md) return;
+    uint8_t *buf = (uint8_t *)md->getBytesNoCopy();
+    uint32_t ok = 0, timeouts = 0, other = 0, beacons = 0, mgmt = 0, crcErr = 0;
+    uint32_t lastErr = 0;
+    bool haveFirst = false, haveSsid = false;
+    char key[48];
+
+    for (int n = 0; n < 15; n++) {
+        uint32_t got = 0;
+        IOReturn r = fPipeIn->io(md, kBuf, got, 150);
+        if (r == kIOReturnTimeout) { timeouts++; continue; }
+        if (r != kIOReturnSuccess) { other++; lastErr = (uint32_t)r; continue; }
+        if (got < 24) { other++; continue; }
+        ok++;
+
+        uint32_t d0 = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+        uint32_t pktlen = d0 & 0x3fff;
+        bool crc = (d0 >> 14) & 1;
+        uint32_t drvinfo = ((d0 >> 16) & 0xf) * 8;
+        uint32_t shift = (d0 >> 24) & 3;
+        uint32_t off = 24 + drvinfo + shift;
+        if (crc) crcErr++;
+
+        if (!haveFirst) {
+            haveFirst = true;
+            snprintf(key, sizeof(key), "rx-ch%d-first-bytes", channel);
+            setProperty(key, buf, got < 64 ? got : 64);
+            snprintf(key, sizeof(key), "rx-ch%d-first-pktlen", channel);
+            setProperty(key, (uint64_t)pktlen, 32);
+            snprintf(key, sizeof(key), "rx-ch%d-first-total", channel);
+            setProperty(key, (uint64_t)got, 32);
+            snprintf(key, sizeof(key), "rx-ch%d-first-drvinfo-shift", channel);
+            setProperty(key, (uint64_t)((drvinfo << 8) | shift), 32);
+        }
+
+        if (!crc && off + 36 <= got) {
+            uint8_t fc0 = buf[off];
+            if (((fc0 >> 2) & 3) == 0) mgmt++;
+            if (fc0 == 0x80) {                         // beacon
+                beacons++;
+                if (!haveSsid) {
+                    uint32_t ie = off + 24 + 12;       // 802.11 header + fixed beacon fields
+                    if (ie + 2 <= got && buf[ie] == 0 && buf[ie + 1] <= 32 && ie + 2 + buf[ie + 1] <= got) {
+                        char ssid[33];
+                        uint8_t len = buf[ie + 1];
+                        for (uint8_t i = 0; i < len; i++) {
+                            uint8_t ch = buf[ie + 2 + i];
+                            ssid[i] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+                        }
+                        ssid[len] = 0;
+                        snprintf(key, sizeof(key), "rx-ch%d-first-ssid", channel);
+                        setProperty(key, ssid);
+                        haveSsid = true;
+                    }
+                }
+            }
+        }
+    }
+    md->release();
+
+    snprintf(key, sizeof(key), "rx-ch%d-ok", channel);        setProperty(key, (uint64_t)ok, 32);
+    snprintf(key, sizeof(key), "rx-ch%d-timeouts", channel);  setProperty(key, (uint64_t)timeouts, 32);
+    snprintf(key, sizeof(key), "rx-ch%d-other", channel);     setProperty(key, (uint64_t)other, 32);
+    snprintf(key, sizeof(key), "rx-ch%d-last-error", channel); setProperty(key, (uint64_t)lastErr, 32);
+    snprintf(key, sizeof(key), "rx-ch%d-beacons", channel);   setProperty(key, (uint64_t)beacons, 32);
+    snprintf(key, sizeof(key), "rx-ch%d-mgmt", channel);      setProperty(key, (uint64_t)mgmt, 32);
+    snprintf(key, sizeof(key), "rx-ch%d-crc-err", channel);   setProperty(key, (uint64_t)crcErr, 32);
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -992,7 +1069,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v12");
+    setProperty("build-tag", "v13");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1079,6 +1156,12 @@ bool RtlWifiDriver::start(IOService *provider) {
             initStatistics();
             r = setChannel20(6);
             setProperty("set-channel-status", (uint64_t)(uint32_t)r, 32);
+            if (r == kIOReturnSuccess) {
+                static const uint8_t kProbeCh[] = {1, 6, 11};
+                for (unsigned k = 0; k < sizeof(kProbeCh); k++) {
+                    if (setChannel20(kProbeCh[k]) == kIOReturnSuccess) rxProbe(kProbeCh[k]);
+                }
+            }
         }
     }
     return true;
