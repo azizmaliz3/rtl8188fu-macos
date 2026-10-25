@@ -1148,6 +1148,19 @@ void RtlWifiDriver::setStationMode() {
     setProperty("cck-check-readback", (uint64_t)rd8(0x0454), 8);
 }
 
+// rtl8188f_set_crystal_cap: the reference applies efuse xtal_k & 0x3f after the PHY tables.
+// Called after the eFuse read here (the efuse is read late in this driver's start()).
+void RtlWifiDriver::setCrystalCap(uint8_t cap) {
+    uint32_t v = rd32(0x0024);                             // REG_AFE_XTAL_CTRL
+    setProperty("afe-xtal-before", (uint64_t)v, 32);
+    setProperty("xtal-cap", (uint64_t)cap, 8);
+    if (cap == 0) return;                                  // reference skips the write when equal to its initial value 0
+    v &= ~(0x007e0000u | 0x0001f800u);                     // XTAL1 = GENMASK(22,17), XTAL0 = GENMASK(16,11)
+    v |= ((uint32_t)cap << 17) | ((uint32_t)cap << 11);
+    wr32(0x0024, v);
+    setProperty("afe-xtal-after", (uint64_t)rd32(0x0024), 32);
+}
+
 // ---------- lifecycle ----------
 
 bool RtlWifiDriver::start(IOService *provider) {
@@ -1155,7 +1168,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v15");
+    setProperty("build-tag", "v16");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1236,6 +1249,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     setProperty("mac-address-str", mac);
 
     if (chainOk && efuseOk && rtlId == 0x8129) {
+        setCrystalCap(fEfuse[0xb9] & 0x3f);                // efuse xtal_k
         r = initCalib();
         setProperty("calib-status", (uint64_t)(uint32_t)r, 32);
         if (r == kIOReturnSuccess) {

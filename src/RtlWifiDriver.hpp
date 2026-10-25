@@ -55,6 +55,7 @@ class RtlWifiDriver : public IOService {
     void     rxProbe(uint8_t channel, char tag);
     IOReturn txProbeRequest(uint8_t channel, uint8_t rate, char tag);
     void     setStationMode();
+    void     setCrystalCap(uint8_t cap);
 
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);
