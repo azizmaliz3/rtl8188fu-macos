@@ -53,9 +53,15 @@ class RtlWifiDriver : public IOService {
     IOReturn setChannel20(uint8_t channel);
     void     initStatistics();
     void     rxProbe(uint8_t channel, char tag);
+    IOReturn txMgmt(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag);
     IOReturn txProbeRequest(uint8_t channel, uint8_t rate, char tag);
+    IOReturn txAuth(uint8_t channel, uint8_t rate, char tag);
+    uint8_t  fApBssid[6];
+    bool     fHaveAp;
+    uint8_t  fApChannel;
     void     setStationMode();
     void     setCrystalCap(uint8_t cap);
+    void     scanAll();
 
     // eFuse (rtl8xxxu_read_efuse8 / rtl8xxxu_read_efuse)
     IOReturn readEfuse8(uint16_t offset, uint8_t *data);
