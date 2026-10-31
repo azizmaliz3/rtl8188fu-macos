@@ -59,6 +59,9 @@ class RtlWifiDriver : public IOService {
     IOReturn txAssoc(uint8_t channel, uint8_t rate, char tag);
     uint8_t  fApBssid[6];
     bool     fHaveAp;
+    uint8_t  fApIes[256];
+    uint16_t fApIeLen;
+    uint16_t fApCap;
     uint8_t  fApChannel;
     void     setStationMode();
     void     setCrystalCap(uint8_t cap);

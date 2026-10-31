@@ -1041,6 +1041,16 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                     if (ie2 + 2 <= got && buf[ie2] == 0 && buf[ie2 + 1] == sizeof(kTestSsid) - 1 &&
                         ie2 + 2 + buf[ie2 + 1] <= got && memcmp(buf + ie2 + 2, kTestSsid, buf[ie2 + 1]) == 0) {
                         memcpy(fApBssid, buf + off + 16, 6);
+                        uint32_t end = off + pktlen;               // frame end without the 4-byte FCS
+                        if (end > got) end = got;
+                        if (end >= off + 40) end -= 4;
+                        uint32_t n = (end > off + 36) ? (end - (off + 36)) : 0;
+                        if (n > sizeof(fApIes)) n = sizeof(fApIes);
+                        memcpy(fApIes, buf + off + 36, n);
+                        fApIeLen = (uint16_t)n;
+                        fApCap = (uint16_t)(buf[off + 34] | (buf[off + 35] << 8));
+                        setProperty("ap-ies", fApIes, fApIeLen);
+                        setProperty("ap-cap", (uint64_t)fApCap, 16);
                         fHaveAp = true;
                         fApChannel = channel;
                     }
@@ -1189,33 +1199,68 @@ IOReturn RtlWifiDriver::txAuth(uint8_t channel, uint8_t rate, char tag) {
     return txMgmt(f, sizeof(f), rate, channel, tag);
 }
 
-// Unicast association request (open system, WPA2-PSK/CCMP RSN IE) to the AP found in the scan.
-// Test shortcut: the SSID is hard-coded.
+// Find an information element by tag in a beacon IE list; returns its length or -1.
+static int findIe(const uint8_t *ies, uint16_t len, uint8_t tag, const uint8_t **data) {
+    uint16_t p = 0;
+    while (p + 2 <= len) {
+        uint8_t t = ies[p], l = ies[p + 1];
+        if (p + 2 + l > len) break;
+        if (t == tag) { *data = ies + p + 2; return l; }
+        p += 2 + l;
+    }
+    return -1;
+}
+
+// Unicast association request to the AP found in the scan. Test shortcut: the SSID is hard-coded, and the
+// supported rates, extended rates and HT capabilities are copied from the AP's own beacon so that the
+// AP's basic rate set is satisfied by construction. The RSN IE selects CCMP + PSK with the AP's group cipher.
 IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     if (!fHaveAp) return kIOReturnBadArgument;
     static const char kTestSsid[] = "TT_4FF8";
     const uint8_t ssidLen = sizeof(kTestSsid) - 1;
-    uint8_t f[128];
+    uint8_t f[200];
     memset(f, 0, sizeof(f));
     f[0] = 0x00;                                    // management, association request
     memcpy(f + 4, fApBssid, 6);                     // DA = AP
     memcpy(f + 10, &fEfuse[0xd7], 6);               // SA = adapter MAC
     memcpy(f + 16, fApBssid, 6);                    // BSSID = AP
     uint16_t n = 24;
-    f[n++] = 0x31; f[n++] = 0x04;                   // capabilities: ESS | privacy | short slot
+    uint16_t cap = (uint16_t)((fApCap & 0x0430) | 0x0001);   // ESS | privacy | short preamble/slot as the AP
+    f[n++] = cap & 0xff; f[n++] = cap >> 8;
     f[n++] = 0x0a; f[n++] = 0x00;                   // listen interval 10
     f[n++] = 0x00; f[n++] = ssidLen;                // SSID IE
     memcpy(f + n, kTestSsid, ssidLen); n += ssidLen;
-    static const uint8_t kRates[] = {0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24};
-    memcpy(f + n, kRates, sizeof(kRates)); n += sizeof(kRates);
-    static const uint8_t kExt[] = {0x32, 0x04, 0x30, 0x48, 0x60, 0x6c};
-    memcpy(f + n, kExt, sizeof(kExt)); n += sizeof(kExt);
-    static const uint8_t kRsn[] = {0x30, 0x14, 0x01, 0x00,
-                                   0x00, 0x0f, 0xac, 0x04,                 // group cipher CCMP
-                                   0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,     // pairwise: CCMP
-                                   0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,     // AKM: PSK
-                                   0x00, 0x00};                            // RSN capabilities
-    memcpy(f + n, kRsn, sizeof(kRsn)); n += sizeof(kRsn);
+
+    const uint8_t *p;
+    int l = findIe(fApIes, fApIeLen, 1, &p);        // supported rates, mirrored
+    if (l > 0 && l <= 8) { f[n++] = 1; f[n++] = (uint8_t)l; memcpy(f + n, p, l); n += l; }
+    l = findIe(fApIes, fApIeLen, 50, &p);           // extended rates (may hold the HT membership selector)
+    if (l > 0 && l <= 16) { f[n++] = 50; f[n++] = (uint8_t)l; memcpy(f + n, p, l); n += l; }
+
+    uint8_t group[4] = {0x00, 0x0f, 0xac, 0x04};
+    uint8_t rsnCaps[2] = {0x00, 0x00};
+    l = findIe(fApIes, fApIeLen, 48, &p);           // AP's RSN IE: take its group cipher and capabilities
+    if (l >= 8) {
+        memcpy(group, p + 2, 4);
+        uint16_t pc = (uint16_t)(p[6] | (p[7] << 8));
+        uint16_t o = 8 + 4 * pc;
+        if (o + 2 <= l) {
+            uint16_t ac = (uint16_t)(p[o] | (p[o + 1] << 8));
+            uint16_t co = o + 2 + 4 * ac;
+            if (co + 2 <= l) memcpy(rsnCaps, p + co, 2);
+        }
+    }
+    f[n++] = 48; f[n++] = 20;
+    f[n++] = 0x01; f[n++] = 0x00;                   // RSN version
+    memcpy(f + n, group, 4); n += 4;
+    f[n++] = 0x01; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x0f; f[n++] = 0xac; f[n++] = 0x04;   // pairwise: CCMP
+    f[n++] = 0x01; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x0f; f[n++] = 0xac; f[n++] = 0x02;   // AKM: PSK
+    f[n++] = rsnCaps[0]; f[n++] = rsnCaps[1];
+
+    l = findIe(fApIes, fApIeLen, 45, &p);           // HT capabilities, mirrored
+    if (l == 26) { f[n++] = 45; f[n++] = 26; memcpy(f + n, p, 26); n += 26; }
+
+    setProperty("assoc-frame-len", (uint64_t)n, 16);
     return txMgmt(f, n, rate, channel, tag);
 }
 
@@ -1345,9 +1390,11 @@ bool RtlWifiDriver::start(IOService *provider) {
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     fHaveAp = false;
     fApChannel = 0;
+    fApIeLen = 0;
+    fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v17");
+    setProperty("build-tag", "v18");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
