@@ -56,6 +56,7 @@ class RtlWifiDriver : public IOService {
     IOReturn txMgmt(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag);
     IOReturn txProbeRequest(uint8_t channel, uint8_t rate, char tag);
     IOReturn txAuth(uint8_t channel, uint8_t rate, char tag);
+    IOReturn txAssoc(uint8_t channel, uint8_t rate, char tag);
     uint8_t  fApBssid[6];
     bool     fHaveAp;
     uint8_t  fApChannel;
