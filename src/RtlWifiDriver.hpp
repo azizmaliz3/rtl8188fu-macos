@@ -57,6 +57,17 @@ class RtlWifiDriver : public IOService {
     IOReturn txProbeRequest(uint8_t channel, uint8_t rate, char tag);
     IOReturn txAuth(uint8_t channel, uint8_t rate, char tag);
     IOReturn txAssoc(uint8_t channel, uint8_t rate, char tag);
+    IOReturn txData(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag);
+    IOReturn txEapolMsg2(uint8_t channel, char tag);
+    void     runHandshake(uint8_t channel);
+    void     selfTest();
+    uint8_t  fPmk[32];
+    uint8_t  fPtk[48];
+    uint8_t  fAnonce[32];
+    uint8_t  fSnonce[32];
+    uint8_t  fReplay[8];
+    uint8_t  fOwnRsn[22];
+    bool     fHavePmk, fHavePtk, fHaveMsg1, fStopOnMsg1;
     uint8_t  fApBssid[6];
     bool     fHaveAp;
     uint8_t  fApIes[256];

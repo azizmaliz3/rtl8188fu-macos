@@ -1,12 +1,16 @@
 #include "RtlWifiDriver.hpp"
 #include "rtl8188fufw.h"          // generated: rtl8188fufw_bin[], rtl8188fufw_bin_len
 #include "RtlWifiTables.h"         // generated: kRtl8188fMacTable[]
+#include "RtlWifiCrypto.h"
+#include "RtlWifiSecrets.h"
 #include "RtlWifiPhyTables.h"      // generated: PHY, AGC and RF tables
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
 
 #define super IOService
+
+static int findIe(const uint8_t *ies, uint16_t len, uint8_t tag, const uint8_t **data);
 OSDefineMetaClassAndStructors(RtlWifiDriver, IOService)
 
 #ifndef BIT
@@ -999,7 +1003,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
     uint32_t lastErr = 0;
     bool haveFirst = false, haveSsid = false, haveProbeSsid = false;
     uint32_t probeResp = 0, authResp = 0, authStatus = 0xffff;
-    uint32_t assocResp = 0, assocStatus = 0xffff, assocAid = 0, eapol = 0;
+    uint32_t assocResp = 0, assocStatus = 0xffff, assocAid = 0, eapol = 0, msg3Ok = 0, msg3Bad = 0;
     char key[48];
 
     for (int n = 0; n < 10; n++) {
@@ -1050,6 +1054,31 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                         fApIeLen = (uint16_t)n;
                         fApCap = (uint16_t)(buf[off + 34] | (buf[off + 35] << 8));
                         setProperty("ap-ies", fApIes, fApIeLen);
+                        {                                      // readable summary of the router's RSN information element
+                            const uint8_t *rp;
+                            int rl = findIe(fApIes, fApIeLen, 48, &rp);
+                            char s[160];
+                            if (rl >= 8) {
+                                int m = snprintf(s, sizeof(s), "group %02x:%02x:%02x:%02x pairwise",
+                                                 rp[2], rp[3], rp[4], rp[5]);
+                                uint16_t pc = (uint16_t)(rp[6] | (rp[7] << 8));
+                                int o = 8;
+                                for (uint16_t q = 0; q < pc && q < 4 && o + 4 <= rl; q++, o += 4)
+                                    m += snprintf(s + m, sizeof(s) - m, " %02x:%02x:%02x:%02x", rp[o], rp[o+1], rp[o+2], rp[o+3]);
+                                o = 8 + 4 * pc;
+                                if (o + 2 <= rl) {
+                                    uint16_t ac = (uint16_t)(rp[o] | (rp[o+1] << 8));
+                                    o += 2;
+                                    m += snprintf(s + m, sizeof(s) - m, " akm");
+                                    for (uint16_t q = 0; q < ac && q < 4 && o + 4 <= rl; q++, o += 4)
+                                        m += snprintf(s + m, sizeof(s) - m, " %02x:%02x:%02x:%02x", rp[o], rp[o+1], rp[o+2], rp[o+3]);
+                                    if (o + 2 <= rl) snprintf(s + m, sizeof(s) - m, " caps %02x%02x", rp[o], rp[o+1]);
+                                }
+                                setProperty("ap-rsn", s);
+                            } else {
+                                setProperty("ap-rsn", "none");
+                            }
+                        }
                         setProperty("ap-cap", (uint64_t)fApCap, 16);
                         fHaveAp = true;
                         fApChannel = channel;
@@ -1100,18 +1129,40 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
         if (!crc && off + 40 <= got && (buf[off] & 0x0c) == 0x08) {   // data frame: look for EAPOL (LLC/SNAP 0x888e)
             uint32_t hl = 24 + ((buf[off] & 0x80) ? 2 : 0);
             static const uint8_t kSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e};
-            if (off + hl + 8 <= got && memcmp(buf + off + hl, kSnap, 8) == 0) eapol++;
+            if (off + hl + 8 <= got && memcmp(buf + off + hl, kSnap, 8) == 0) {
+                eapol++;
+                uint32_t es = off + hl + 8;                        // EAPOL header
+                if (es + 99 <= got && buf[es + 1] == 3 && buf[es + 4] == 2) {   // EAPOL-Key, RSN descriptor
+                    uint16_t ki = (uint16_t)((buf[es + 5] << 8) | buf[es + 6]);
+                    uint32_t flen = 4 + (uint32_t)((buf[es + 2] << 8) | buf[es + 3]);
+                    if (ki == 0x008a && !fHaveMsg1) {              // message 1: ANonce and replay counter
+                        memcpy(fAnonce, buf + es + 17, 32);
+                        memcpy(fReplay, buf + es + 9, 8);
+                        fHaveMsg1 = true;
+                    } else if (ki == 0x13ca && fHavePtk && flen <= 400 && es + flen <= got) {   // message 3: check its MIC
+                        uint8_t tmp[400];
+                        memcpy(tmp, buf + es, flen);
+                        memset(tmp + 81, 0, 16);
+                        uint8_t mic[16];
+                        rtlcrypto::eapol_mic(fPtk, tmp, flen, mic);
+                        if (memcmp(mic, buf + es + 81, 16) == 0) msg3Ok++; else msg3Bad++;
+                    }
+                }
+            }
         }
         if (!crc && off + 30 <= got && buf[off] == 0xb0) {      // authentication response
             authResp++;
             if (authResp == 1) authStatus = (uint32_t)buf[off + 28] | ((uint32_t)buf[off + 29] << 8);
         }
+        if (fStopOnMsg1 && fHaveMsg1) break;
     }
     md->release();
     snprintf(key, sizeof(key), "rx-ch%d%c-assocresp", channel, tag); setProperty(key, (uint64_t)assocResp, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-assoc-status", channel, tag); setProperty(key, (uint64_t)assocStatus, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-assoc-aid", channel, tag); setProperty(key, (uint64_t)assocAid, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-eapol", channel, tag); setProperty(key, (uint64_t)eapol, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-msg3-ok", channel, tag); setProperty(key, (uint64_t)msg3Ok, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-msg3-bad", channel, tag); setProperty(key, (uint64_t)msg3Bad, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-authresp", channel, tag); setProperty(key, (uint64_t)authResp, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-auth-status", channel, tag); setProperty(key, (uint64_t)authStatus, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-proberesp", channel, tag); setProperty(key, (uint64_t)probeResp, 32);
@@ -1250,18 +1301,123 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
             if (co + 2 <= l) memcpy(rsnCaps, p + co, 2);
         }
     }
+    uint16_t rsnStart = n;
     f[n++] = 48; f[n++] = 20;
     f[n++] = 0x01; f[n++] = 0x00;                   // RSN version
     memcpy(f + n, group, 4); n += 4;
     f[n++] = 0x01; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x0f; f[n++] = 0xac; f[n++] = 0x04;   // pairwise: CCMP
     f[n++] = 0x01; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x0f; f[n++] = 0xac; f[n++] = 0x02;   // AKM: PSK
     f[n++] = rsnCaps[0]; f[n++] = rsnCaps[1];
+    memcpy(fOwnRsn, f + rsnStart, 22);
 
     l = findIe(fApIes, fApIeLen, 45, &p);           // HT capabilities, mirrored
     if (l == 26) { f[n++] = 45; f[n++] = 26; memcpy(f + n, p, 26); n += 26; }
 
     setProperty("assoc-frame-len", (uint64_t)n, 16);
     return txMgmt(f, n, rate, channel, tag);
+}
+
+// Send one data frame through the best-effort queue (bulk-OUT 0x03). Same descriptor layout as txMgmt,
+// but queue 0 (BE), first/last segment and a unicast destination.
+IOReturn RtlWifiDriver::txData(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag) {
+    if (!fPipeOut3 || len > 260) return kIOReturnBadArgument;
+    uint8_t pkt[320];
+    memset(pkt, 0, sizeof(pkt));
+    uint8_t *d = pkt;
+    memcpy(pkt + 40, frame, len);
+    d[0] = len & 0xff; d[1] = len >> 8;             // pkt_size
+    d[2] = 40;                                      // pkt_offset = descriptor size
+    d[3] = 0x80 | 0x08 | 0x04;                      // OWN | FIRST | LAST
+    uint32_t w;
+    w = (0x0u << 8);               memcpy(d + 4,  &w, 4);   // txdw1: queue = BE, macid 0
+    w = BIT(16);                   memcpy(d + 8,  &w, 4);   // txdw2: AGG_BREAK
+    w = BIT(8);                    memcpy(d + 12, &w, 4);   // txdw3: USE_DRIVER_RATE
+    w = rate | (6u << 18) | BIT(17); memcpy(d + 16, &w, 4); // txdw4: rate, retry limit 6
+    w = BIT(15);                   memcpy(d + 32, &w, 4);   // txdw8: HW_SEQ_ENABLE
+    uint16_t csum = 0;
+    for (int i = 0; i < 16; i++) csum ^= (uint16_t)(d[2 * i] | (d[2 * i + 1] << 8));
+    d[28] = csum & 0xff; d[29] = csum >> 8;
+
+    uint32_t total = 40 + len;
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionOut, total, 1);
+    if (!md) return kIOReturnNoMemory;
+    memcpy(md->getBytesNoCopy(), pkt, total);
+    uint32_t got = 0;
+    IOReturn r = fPipeOut3->io(md, total, got, 500);
+    md->release();
+    char key[48];
+    snprintf(key, sizeof(key), "tx-ch%d%c-status", channel, tag); setProperty(key, (uint64_t)(uint32_t)r, 32);
+    snprintf(key, sizeof(key), "tx-ch%d%c-bytes", channel, tag);  setProperty(key, (uint64_t)got, 32);
+    return r;
+}
+
+// EAPOL-Key message 2 of the WPA2 four-way handshake: SNonce, our RSN IE, MIC over the whole EAPOL frame
+IOReturn RtlWifiDriver::txEapolMsg2(uint8_t channel, char tag) {
+    uint8_t f[24 + 8 + 99 + 22];
+    memset(f, 0, sizeof(f));
+    f[0] = 0x08; f[1] = 0x01;                       // data frame, to DS
+    memcpy(f + 4, fApBssid, 6);                     // addr1 = AP
+    memcpy(f + 10, &fEfuse[0xd7], 6);               // addr2 = SA
+    memcpy(f + 16, fApBssid, 6);                    // addr3 = DA (the authenticator)
+    static const uint8_t kSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e};
+    memcpy(f + 24, kSnap, 8);
+    uint8_t *e = f + 32;                            // EAPOL frame: 99 + 22 bytes
+    e[0] = 1; e[1] = 3;                             // version 1, type key
+    uint16_t body = (99 - 4) + 22;
+    e[2] = body >> 8; e[3] = body & 0xff;
+    e[4] = 2;                                       // RSN key descriptor
+    e[5] = 0x01; e[6] = 0x0a;                       // key info: version 2 (HMAC-SHA1/AES), pairwise, MIC
+    memcpy(e + 9, fReplay, 8);                      // replay counter from message 1
+    memcpy(e + 17, fSnonce, 32);
+    e[97] = 0; e[98] = 22;                          // key data length
+    memcpy(e + 99, fOwnRsn, 22);
+    uint8_t mic[16];
+    rtlcrypto::eapol_mic(fPtk, e, 99 + 22, mic);    // KCK = first 16 bytes of the PTK, MIC field still zero
+    memcpy(e + 81, mic, 16);
+    return txData(f, sizeof(f), 0x00, channel, tag);   // 1M CCK
+}
+
+// Derive the keys and answer message 1; then listen for message 3 and check its MIC
+void RtlWifiDriver::runHandshake(uint8_t ch) {
+    if (!fHavePmk) { setProperty("hs-status", "no passphrase set"); return; }
+    if (!fHaveMsg1) { setProperty("hs-status", "no EAPOL message 1"); return; }
+    // Test shortcut, no random source: SNonce = HMAC-SHA1(PMK, MAC || ANonce) in two blocks
+    uint8_t d[38];
+    memcpy(d, &fEfuse[0xd7], 6);
+    memcpy(d + 6, fAnonce, 32);
+    uint8_t s1[20], s2[20];
+    rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s1);
+    d[0] ^= 0x5a;
+    rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s2);
+    memcpy(fSnonce, s1, 20);
+    memcpy(fSnonce + 20, s2, 12);
+    rtlcrypto::derive_ptk(fPmk, fApBssid, &fEfuse[0xd7], fAnonce, fSnonce, fPtk);
+    fHavePtk = true;
+    IOReturn r = txEapolMsg2(ch, 'g');
+    setProperty("hs-msg2-status", (uint64_t)(uint32_t)r, 32);
+    rxProbe(ch, 'g');
+    setProperty("hs-status", "message 2 sent");
+}
+
+// Known-answer tests for the crypto code, run in the kernel
+void RtlWifiDriver::selfTest() {
+    uint8_t o[20];
+    rtlcrypto::Sha1 s;
+    rtlcrypto::sha1_init(s);
+    rtlcrypto::sha1_update(s, (const uint8_t *)"abc", 3);
+    rtlcrypto::sha1_final(s, o);
+    static const uint8_t kSha[20] = {0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d};
+    setProperty("selftest-sha1", memcmp(o, kSha, 20) == 0 ? kOSBooleanTrue : kOSBooleanFalse);
+    uint8_t key[20];
+    memset(key, 0x0b, 20);
+    rtlcrypto::hmac_sha1(key, 20, (const uint8_t *)"Hi There", 8, o);
+    static const uint8_t kHmac[20] = {0xb6,0x17,0x31,0x86,0x55,0x05,0x72,0x64,0xe2,0x8b,0xc0,0xb6,0xfb,0x37,0x8c,0x8e,0xf1,0x46,0xbe,0x00};
+    setProperty("selftest-hmac", memcmp(o, kHmac, 20) == 0 ? kOSBooleanTrue : kOSBooleanFalse);
+    uint8_t pmk[32];
+    rtlcrypto::pbkdf2_pmk("password", (const uint8_t *)"IEEE", 4, pmk);
+    static const uint8_t kPmk[32] = {0xf4,0x2c,0x6f,0xc5,0x2d,0xf0,0xeb,0xef,0x9e,0xbb,0x4b,0x90,0xb3,0x8a,0x5f,0x90,
+                                     0x2e,0x83,0xfe,0x1b,0x13,0x5a,0x70,0xe2,0x3a,0xed,0x76,0x2e,0x97,0x10,0xa1,0x2e};
+    setProperty("selftest-pbkdf2", memcmp(pmk, kPmk, 32) == 0 ? kOSBooleanTrue : kOSBooleanFalse);
 }
 
 // rtl8xxxu_add_interface for a station: beacon control, link type, MAC address (set earlier)
@@ -1389,12 +1545,13 @@ bool RtlWifiDriver::start(IOService *provider) {
     fInterface = nullptr;
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     fHaveAp = false;
+    fHavePmk = fHavePtk = fHaveMsg1 = fStopOnMsg1 = false;
     fApChannel = 0;
     fApIeLen = 0;
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v18");
+    setProperty("build-tag", "v19");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1498,13 +1655,22 @@ bool RtlWifiDriver::start(IOService *provider) {
                              fApBssid[0], fApBssid[1], fApBssid[2], fApBssid[3], fApBssid[4], fApBssid[5]);
                     setProperty("ap-bssid", bs);
                     setProperty("ap-channel", (uint64_t)fApChannel, 8);
+                    selfTest();
+                    if (strcmp(RTL_TEST_PASSPHRASE, "CHANGE_ME") != 0 && strlen(RTL_TEST_PASSPHRASE) >= 8) {
+                        rtlcrypto::pbkdf2_pmk(RTL_TEST_PASSPHRASE, (const uint8_t *)"TT_4FF8", 7, fPmk);
+                        fHavePmk = true;
+                    }
+                    setProperty("passphrase-set", fHavePmk ? kOSBooleanTrue : kOSBooleanFalse);
                     if (setChannel20(fApChannel) == kIOReturnSuccess) {
                         for (int t = 0; t < 3; t++) { txAuth(fApChannel, 0x04, 'e'); IOSleep(10); }   // 6M OFDM first
                         rxProbe(fApChannel, 'e');
                         for (int t = 0; t < 3; t++) { txAuth(fApChannel, 0x00, 'c'); IOSleep(10); }   // 1M CCK
                         rxProbe(fApChannel, 'c');
                         for (int t = 0; t < 2; t++) { txAssoc(fApChannel, 0x00, 'f'); IOSleep(10); }  // association, 1M CCK
+                        fStopOnMsg1 = true;
                         rxProbe(fApChannel, 'f');
+                        fStopOnMsg1 = false;
+                        runHandshake(fApChannel);
                     }
                 }
             }
