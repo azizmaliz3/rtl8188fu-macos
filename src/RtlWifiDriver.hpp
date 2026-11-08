@@ -73,7 +73,7 @@ class RtlWifiDriver : public IOService {
     uint8_t  fSnonce[32];
     uint8_t  fReplay[8];
     uint8_t  fOwnRsn[22];
-    bool     fHavePmk, fHavePtk, fHaveMsg1, fStopOnMsg1, fStopOnMsg3;
+    bool     fHavePmk, fHavePtk, fHaveMsg1, fStopOnMsg1, fStopOnMsg3, fNewMsg1;
     uint8_t  fApBssid[6];
     bool     fHaveAp;
     uint8_t  fApIes[256];

@@ -1141,8 +1141,11 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                 if (es + 99 <= got && buf[es + 1] == 3 && buf[es + 4] == 2) {   // EAPOL-Key, RSN descriptor
                     uint16_t ki = (uint16_t)((buf[es + 5] << 8) | buf[es + 6]);
                     uint32_t flen = 4 + (uint32_t)((buf[es + 2] << 8) | buf[es + 3]);
-                    if (ki == 0x008a && !fHaveMsg1) {              // message 1: ANonce and replay counter
-                        memcpy(fAnonce, buf + es + 17, 32);
+                    if (ki == 0x008a) {                            // message 1: ANonce and replay counter
+                        if (!fHaveMsg1 || memcmp(fAnonce, buf + es + 17, 32) != 0) {
+                            memcpy(fAnonce, buf + es + 17, 32);    // a new ANonce: the router restarted the handshake
+                            fNewMsg1 = true;
+                        }
                         memcpy(fReplay, buf + es + 9, 8);
                         fHaveMsg1 = true;
                     } else if (ki == 0x13ca && fHavePtk && flen <= 400 && es + flen <= got) {   // message 3: check its MIC
@@ -1163,7 +1166,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
             authResp++;
             if (authResp == 1) authStatus = (uint32_t)buf[off + 28] | ((uint32_t)buf[off + 29] << 8);
         }
-        if ((fStopOnMsg1 && fHaveMsg1) || (fStopOnMsg3 && fHaveMsg3)) break;
+        if ((fStopOnMsg1 && fHaveMsg1) || (fStopOnMsg3 && (fHaveMsg3 || fNewMsg1))) break;
     }
     md->release();
     snprintf(key, sizeof(key), "rx-ch%d%c-assocresp", channel, tag); setProperty(key, (uint64_t)assocResp, 32);
@@ -1394,23 +1397,31 @@ IOReturn RtlWifiDriver::txEapolMsg2(uint8_t channel, char tag) {
 void RtlWifiDriver::runHandshake(uint8_t ch) {
     if (!fHavePmk) { setProperty("hs-status", "no passphrase set"); return; }
     if (!fHaveMsg1) { setProperty("hs-status", "no EAPOL message 1"); return; }
-    // Test shortcut, no random source: SNonce = HMAC-SHA1(PMK, MAC || ANonce) in two blocks
-    uint8_t d[38];
-    memcpy(d, &fEfuse[0xd7], 6);
-    memcpy(d + 6, fAnonce, 32);
-    uint8_t s1[20], s2[20];
-    rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s1);
-    d[0] ^= 0x5a;
-    rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s2);
-    memcpy(fSnonce, s1, 20);
-    memcpy(fSnonce + 20, s2, 12);
-    rtlcrypto::derive_ptk(fPmk, fApBssid, &fEfuse[0xd7], fAnonce, fSnonce, fPtk);
-    fHavePtk = true;
-    IOReturn r = txEapolMsg2(ch, 'g');
+    int attempt = 0;
+    IOReturn r = kIOReturnSuccess;
+    for (attempt = 1; attempt <= 4; attempt++) {
+        // Test shortcut, no random source: SNonce = HMAC-SHA1(PMK, MAC || ANonce) in two blocks
+        uint8_t d[38];
+        memcpy(d, &fEfuse[0xd7], 6);
+        memcpy(d + 6, fAnonce, 32);
+        uint8_t s1[20], s2[20];
+        rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s1);
+        d[0] ^= 0x5a;
+        rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s2);
+        memcpy(fSnonce, s1, 20);
+        memcpy(fSnonce + 20, s2, 12);
+        rtlcrypto::derive_ptk(fPmk, fApBssid, &fEfuse[0xd7], fAnonce, fSnonce, fPtk);
+        fHavePtk = true;
+        fHaveMsg3 = false;
+        fNewMsg1 = false;
+        r = txEapolMsg2(ch, 'g');
+        fStopOnMsg3 = true;                                                // stop at message 3 or at a new message 1
+        rxProbe(ch, 'g');
+        fStopOnMsg3 = false;
+        if (fHaveMsg3 || !fNewMsg1) break;                                 // got message 3, or nothing new arrived
+    }
     setProperty("hs-msg2-status", (uint64_t)(uint32_t)r, 32);
-    fStopOnMsg3 = true;                                                    // answer message 3 quickly
-    rxProbe(ch, 'g');
-    fStopOnMsg3 = false;
+    setProperty("hs-attempts", (uint64_t)attempt, 8);
     if (!fHaveMsg3) { setProperty("hs-status", "message 2 sent, no valid message 3"); return; }
 
     // message 3: key data is AES key-wrapped with the KEK (PTK bytes 16..31)
@@ -1677,7 +1688,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v20");
+    setProperty("build-tag", "v21");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1792,7 +1803,7 @@ bool RtlWifiDriver::start(IOService *provider) {
                         rxProbe(fApChannel, 'e');
                         for (int t = 0; t < 3; t++) { txAuth(fApChannel, 0x00, 'c'); IOSleep(10); }   // 1M CCK
                         rxProbe(fApChannel, 'c');
-                        for (int t = 0; t < 2; t++) { txAssoc(fApChannel, 0x00, 'f'); IOSleep(10); }  // association, 1M CCK
+                        for (int t = 0; t < 1; t++) { txAssoc(fApChannel, 0x00, 'f'); IOSleep(10); }  // association, 1M CCK
                         fStopOnMsg1 = true;
                         rxProbe(fApChannel, 'f');
                         fStopOnMsg1 = false;
