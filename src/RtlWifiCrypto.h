@@ -146,4 +146,91 @@ static inline void eapol_mic(const uint8_t kck[16], const uint8_t *frame, size_t
     memcpy(mic, d, 16);
 }
 
+// ---- AES-128 (decrypt only, S-box computed at run time) and RFC 3394 key unwrap, for the GTK in EAPOL message 3 ----
+struct Aes { uint8_t sbox[256]; uint8_t isbox[256]; uint8_t rk[176]; };
+
+static inline uint8_t aes_rotl8(uint8_t x, int s) { return (uint8_t)((x << s) | (x >> (8 - s))); }
+static inline uint8_t aes_xtime(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
+static inline uint8_t aes_gmul(uint8_t a, uint8_t b) {
+    uint8_t p = 0;
+    while (b) { if (b & 1) p ^= a; a = aes_xtime(a); b >>= 1; }
+    return p;
+}
+
+static inline void aes_init(Aes &a, const uint8_t key[16]) {
+    uint8_t p = 1, q = 1;
+    do {
+        p = (uint8_t)(p ^ (uint8_t)(p << 1) ^ ((p & 0x80) ? 0x1b : 0));              // p *= 3
+        q = (uint8_t)(q ^ (uint8_t)(q << 1));
+        q = (uint8_t)(q ^ (uint8_t)(q << 2));
+        q = (uint8_t)(q ^ (uint8_t)(q << 4));
+        if (q & 0x80) q ^= 0x09;                                                        // q /= 3
+        uint8_t x = (uint8_t)(q ^ aes_rotl8(q, 1) ^ aes_rotl8(q, 2) ^ aes_rotl8(q, 3) ^ aes_rotl8(q, 4));
+        a.sbox[p] = (uint8_t)(x ^ 0x63);
+    } while (p != 1);
+    a.sbox[0] = 0x63;
+    for (int i = 0; i < 256; i++) a.isbox[a.sbox[i]] = (uint8_t)i;
+    memcpy(a.rk, key, 16);
+    uint8_t rcon = 1;
+    for (int i = 16; i < 176; i += 4) {
+        uint8_t t[4];
+        memcpy(t, a.rk + i - 4, 4);
+        if ((i % 16) == 0) {
+            uint8_t u = t[0];
+            t[0] = (uint8_t)(a.sbox[t[1]] ^ rcon); t[1] = a.sbox[t[2]]; t[2] = a.sbox[t[3]]; t[3] = a.sbox[u];
+            rcon = aes_xtime(rcon);
+        }
+        for (int j = 0; j < 4; j++) a.rk[i + j] = (uint8_t)(a.rk[i - 16 + j] ^ t[j]);
+    }
+}
+
+static inline void aes_decrypt_block(const Aes &a, const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16], t[16];
+    for (int i = 0; i < 16; i++) s[i] = (uint8_t)(in[i] ^ a.rk[160 + i]);
+    for (int round = 9; round >= 0; round--) {
+        for (int c = 0; c < 4; c++)                                  // inverse ShiftRows
+            for (int r = 0; r < 4; r++) t[4 * ((c + r) % 4) + r] = s[4 * c + r];
+        for (int i = 0; i < 16; i++) s[i] = a.isbox[t[i]];             // inverse SubBytes
+        for (int i = 0; i < 16; i++) s[i] ^= a.rk[16 * round + i];     // AddRoundKey
+        if (round > 0) {                                             // inverse MixColumns
+            for (int c = 0; c < 4; c++) {
+                uint8_t a0 = s[4*c], a1 = s[4*c+1], a2 = s[4*c+2], a3 = s[4*c+3];
+                s[4*c]   = (uint8_t)(aes_gmul(a0,14) ^ aes_gmul(a1,11) ^ aes_gmul(a2,13) ^ aes_gmul(a3,9));
+                s[4*c+1] = (uint8_t)(aes_gmul(a0,9)  ^ aes_gmul(a1,14) ^ aes_gmul(a2,11) ^ aes_gmul(a3,13));
+                s[4*c+2] = (uint8_t)(aes_gmul(a0,13) ^ aes_gmul(a1,9)  ^ aes_gmul(a2,14) ^ aes_gmul(a3,11));
+                s[4*c+3] = (uint8_t)(aes_gmul(a0,11) ^ aes_gmul(a1,13) ^ aes_gmul(a2,9)  ^ aes_gmul(a3,14));
+            }
+        }
+    }
+    memcpy(out, s, 16);
+}
+
+// RFC 3394 AES key unwrap with a 128-bit KEK. inLen is a multiple of 8, at least 24 and at most 208.
+// Writes inLen - 8 bytes to out; returns true when the integrity value 0xA6A6A6A6A6A6A6A6 checks out.
+static inline bool aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t inLen, uint8_t *out) {
+    if (inLen < 24 || inLen > 208 || (inLen % 8)) return false;
+    Aes a; aes_init(a, kek);
+    size_t n = inLen / 8 - 1;
+    uint8_t A[8], R[200], B[16];
+    memcpy(A, in, 8);
+    memcpy(R, in + 8, n * 8);
+    for (int j = 5; j >= 0; j--) {
+        for (size_t i = n; i >= 1; i--) {
+            uint32_t t = (uint32_t)(n * (size_t)j + i);
+            uint8_t ax[8];
+            memcpy(ax, A, 8);
+            ax[7] ^= (uint8_t)t; ax[6] ^= (uint8_t)(t >> 8); ax[5] ^= (uint8_t)(t >> 16); ax[4] ^= (uint8_t)(t >> 24);
+            memcpy(B, ax, 8);
+            memcpy(B + 8, R + (i - 1) * 8, 8);
+            uint8_t o[16];
+            aes_decrypt_block(a, B, o);
+            memcpy(A, o, 8);
+            memcpy(R + (i - 1) * 8, o + 8, 8);
+        }
+    }
+    memcpy(out, R, n * 8);
+    for (int i = 0; i < 8; i++) if (A[i] != 0xa6) return false;
+    return true;
+}
+
 } // namespace rtlcrypto

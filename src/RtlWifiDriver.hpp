@@ -60,6 +60,12 @@ class RtlWifiDriver : public IOService {
     IOReturn txData(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag);
     IOReturn txEapolMsg2(uint8_t channel, char tag);
     void     runHandshake(uint8_t channel);
+    IOReturn txEapolMsg4(uint8_t channel, char tag);
+    void     camWrite(uint8_t idx, uint8_t cipher, uint8_t keyId, bool group, const uint8_t *mac, const uint8_t *key16);
+    void     installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t *gtk16, uint8_t channel);
+    uint8_t  fMsg3[400];
+    uint16_t fMsg3Len;
+    bool     fHaveMsg3;
     void     selfTest();
     uint8_t  fPmk[32];
     uint8_t  fPtk[48];
@@ -67,7 +73,7 @@ class RtlWifiDriver : public IOService {
     uint8_t  fSnonce[32];
     uint8_t  fReplay[8];
     uint8_t  fOwnRsn[22];
-    bool     fHavePmk, fHavePtk, fHaveMsg1, fStopOnMsg1;
+    bool     fHavePmk, fHavePtk, fHaveMsg1, fStopOnMsg1, fStopOnMsg3;
     uint8_t  fApBssid[6];
     bool     fHaveAp;
     uint8_t  fApIes[256];
