@@ -58,6 +58,12 @@ class RtlWifiDriver : public IOService {
     IOReturn txAuth(uint8_t channel, uint8_t rate, char tag);
     IOReturn txAssoc(uint8_t channel, uint8_t rate, char tag);
     IOReturn txData(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag);
+    IOReturn txDataSec(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag, uint32_t secType, bool bmc);
+    void     runDhcpTest(uint8_t channel);
+    uint8_t  fRxLoops;
+    bool     fStopOnOffer, fHaveOffer, fOfferProt, fOfferBcast;
+    uint8_t  fOfferIp[4], fOfferSrv[4];
+    uint32_t fMsg3Retx;
     IOReturn txEapolMsg2(uint8_t channel, char tag);
     void     runHandshake(uint8_t channel);
     IOReturn txEapolMsg4(uint8_t channel, char tag);

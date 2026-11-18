@@ -993,6 +993,8 @@ void RtlWifiDriver::initStatistics() {
 // First receive test: synchronous bulk-IN reads on the current channel. Decodes the 24-byte RX descriptor
 // (rtl8xxxu_rxdesc24: dword0 = pktlen[13:0], crc32[14], icverr[15], drvinfo_sz[19:16], shift[25:24])
 // and reports counts, the first frame bytes and the SSID of the first beacon as properties.
+static const uint8_t kDhcpXid[4] = {0x52, 0x54, 0x4c, 0x38};   // DHCP transaction id used by the test
+
 void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
     if (!fPipeIn) return;
     const uint32_t kBuf = 16384;
@@ -1005,9 +1007,10 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
     uint32_t probeResp = 0, authResp = 0, authStatus = 0xffff;
     uint32_t assocResp = 0, assocStatus = 0xffff, assocAid = 0, eapol = 0, msg3Ok = 0, msg3Bad = 0;
     uint32_t prot = 0, decSnap = 0, secFirst = 0xff, swdecFirst = 0xff;
+    uint32_t icvErr = 0, deauth = 0, deauthReason = 0xffff, dhcpReplies = 0, protMcs = 0xff, protIvLen = 0xff;
     char key[48];
 
-    for (int n = 0; n < 10; n++) {
+    for (int n = 0; n < (int)fRxLoops; n++) {
         uint32_t got = 0;
         IOReturn r = fPipeIn->io(md, kBuf, got, 150);
         if (r == kIOReturnTimeout) { timeouts++; continue; }
@@ -1022,6 +1025,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
         uint32_t shift = (d0 >> 24) & 3;
         uint32_t off = 24 + drvinfo + shift;
         if (crc) crcErr++;
+        if ((d0 >> 15) & 1) icvErr++;
 
         if (!haveFirst) {
             haveFirst = true;
@@ -1038,6 +1042,10 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
         if (!crc && off + 36 <= got) {
             uint8_t fc0 = buf[off];
             if (((fc0 >> 2) & 3) == 0) mgmt++;
+            if (fc0 == 0xc0 || fc0 == 0xa0) {                  // deauthentication / disassociation
+                deauth++;
+                if (deauthReason == 0xffff) deauthReason = (uint32_t)buf[off + 24] | ((uint32_t)buf[off + 25] << 8);
+            }
             if (fc0 == 0x80) {                         // beacon
                 beacons++;
                 if (!fHaveAp) {                        // test shortcut: look for the user's own router
@@ -1132,8 +1140,54 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
             static const uint8_t kSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e};
             if (buf[off + 1] & 0x40) {                                 // protected data frame
                 prot++;
-                if (secFirst == 0xff) { secFirst = (d0 >> 20) & 7; swdecFirst = (d0 >> 27) & 1; }
+                if (secFirst == 0xff) {
+                    secFirst = (d0 >> 20) & 7; swdecFirst = (d0 >> 27) & 1;
+                    uint32_t d2 = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
+                    protIvLen = (d2 >> 18) & 0x3f;
+                    protMcs = buf[12] & 0x7f;
+                }
                 if (off + hl + 8 + 6 <= got && memcmp(buf + off + hl + 8, kSnap, 6) == 0) decSnap++;   // LLC after the 8-byte IV
+            }
+            {                                                              // DHCP reply (BOOTP op 2) from the router, decrypted by the chip
+                bool pr = (buf[off + 1] & 0x40) != 0;
+                uint32_t p0 = off + hl + (pr ? 8 : 0);                     // 8-byte IV stays in the frame
+                uint32_t fend = off + pktlen;
+                if (fend > got) fend = got;
+                if (pktlen > 4 && fend >= 4) fend -= 4;                    // drop FCS
+                static const uint8_t kIpSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00};
+                if (p0 + 8 + 20 + 8 + 240 <= fend && memcmp(buf + p0, kIpSnap, 8) == 0) {
+                    uint32_t ip = p0 + 8;
+                    uint32_t ihl = (uint32_t)(buf[ip] & 0x0f) * 4;
+                    if ((buf[ip] >> 4) == 4 && ihl >= 20 && buf[ip + 9] == 17 && ip + ihl + 8 + 240 <= fend) {
+                        uint32_t u = ip + ihl;
+                        uint16_t sp = (uint16_t)((buf[u] << 8) | buf[u + 1]);
+                        uint16_t dp = (uint16_t)((buf[u + 2] << 8) | buf[u + 3]);
+                        uint32_t b = u + 8;
+                        static const uint8_t kCookie[4] = {0x63, 0x82, 0x53, 0x63};
+                        if (sp == 67 && dp == 68 && buf[b] == 2 && memcmp(buf + b + 4, kDhcpXid, 4) == 0 &&
+                            memcmp(buf + b + 236, kCookie, 4) == 0) {
+                            dhcpReplies++;
+                            uint8_t mt = 0;
+                            const uint8_t *srv = nullptr;
+                            uint32_t o = b + 240;
+                            while (o + 2 <= fend && buf[o] != 255) {
+                                if (buf[o] == 0) { o++; continue; }
+                                uint8_t ot = buf[o], ol = buf[o + 1];
+                                if (o + 2 + ol > fend) break;
+                                if (ot == 53 && ol == 1) mt = buf[o + 2];
+                                if (ot == 54 && ol == 4) srv = buf + o + 2;
+                                o += 2 + ol;
+                            }
+                            if (mt == 2 && !fHaveOffer) {                  // DHCP offer
+                                memcpy(fOfferIp, buf + b + 16, 4);
+                                if (srv) memcpy(fOfferSrv, srv, 4); else memset(fOfferSrv, 0, 4);
+                                fOfferProt = pr;
+                                fOfferBcast = (buf[off + 4] & 1) != 0;     // addr1 group bit: sent with the group key
+                                fHaveOffer = true;
+                            }
+                        }
+                    }
+                }
             }
             if (off + hl + 8 <= got && memcmp(buf + off + hl, kSnap, 8) == 0) {
                 eapol++;
@@ -1157,6 +1211,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                         if (memcmp(mic, buf + es + 81, 16) == 0) {
                             msg3Ok++;
                             if (!fHaveMsg3) { memcpy(fMsg3, buf + es, flen); fMsg3Len = (uint16_t)flen; fHaveMsg3 = true; }
+                            else { memcpy(fMsg3 + 9, buf + es + 9, 8); fMsg3Retx++; }   // retransmitted message 3: newest replay counter
                         } else msg3Bad++;
                     }
                 }
@@ -1166,7 +1221,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
             authResp++;
             if (authResp == 1) authStatus = (uint32_t)buf[off + 28] | ((uint32_t)buf[off + 29] << 8);
         }
-        if ((fStopOnMsg1 && fHaveMsg1) || (fStopOnMsg3 && (fHaveMsg3 || fNewMsg1))) break;
+        if ((fStopOnMsg1 && fHaveMsg1) || (fStopOnMsg3 && (fHaveMsg3 || fNewMsg1)) || (fStopOnOffer && fHaveOffer)) break;
     }
     md->release();
     snprintf(key, sizeof(key), "rx-ch%d%c-assocresp", channel, tag); setProperty(key, (uint64_t)assocResp, 32);
@@ -1182,6 +1237,12 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
     snprintf(key, sizeof(key), "rx-ch%d%c-authresp", channel, tag); setProperty(key, (uint64_t)authResp, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-auth-status", channel, tag); setProperty(key, (uint64_t)authStatus, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-proberesp", channel, tag); setProperty(key, (uint64_t)probeResp, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-icverr", channel, tag); setProperty(key, (uint64_t)icvErr, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-deauth", channel, tag); setProperty(key, (uint64_t)deauth, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-deauth-reason", channel, tag); setProperty(key, (uint64_t)deauthReason, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-dhcp-replies", channel, tag); setProperty(key, (uint64_t)dhcpReplies, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-prot-mcs", channel, tag); setProperty(key, (uint64_t)protMcs, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-prot-ivlen", channel, tag); setProperty(key, (uint64_t)protIvLen, 32);
 
     snprintf(key, sizeof(key), "rx-ch%d%c-ok", channel, tag);        setProperty(key, (uint64_t)ok, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-timeouts", channel, tag);  setProperty(key, (uint64_t)timeouts, 32);
@@ -1335,17 +1396,21 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
 
 // Send one data frame through the best-effort queue (bulk-OUT 0x03). Same descriptor layout as txMgmt,
 // but queue 0 (BE), first/last segment and a unicast destination.
-IOReturn RtlWifiDriver::txData(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag) {
-    if (!fPipeOut3 || len > 260) return kIOReturnBadArgument;
-    uint8_t pkt[320];
+// secType: 0 = clear, 0x00c00000 = AES/CCMP, 0x00400000 = RC4/TKIP (txdw1 bits 22..23, from rtl8xxxu.h).
+// With a protected frame the chip adds IV and MIC itself (Linux sets IEEE80211_KEY_FLAG_GENERATE_IV): the
+// frame passed in has the Protected bit set in its frame control and no IV.
+IOReturn RtlWifiDriver::txDataSec(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag, uint32_t secType, bool bmc) {
+    if (!fPipeOut3 || len > 400) return kIOReturnBadArgument;
+    uint8_t pkt[448];
     memset(pkt, 0, sizeof(pkt));
     uint8_t *d = pkt;
     memcpy(pkt + 40, frame, len);
     d[0] = len & 0xff; d[1] = len >> 8;             // pkt_size
     d[2] = 40;                                      // pkt_offset = descriptor size
     d[3] = 0x80 | 0x08 | 0x04;                      // OWN | FIRST | LAST
+    if (bmc) d[3] |= 0x01;                          // TXDESC_BROADMULTICAST (destination address is group)
     uint32_t w;
-    w = (0x0u << 8);               memcpy(d + 4,  &w, 4);   // txdw1: queue = BE, macid 0
+    w = (0x0u << 8) | secType;     memcpy(d + 4,  &w, 4);   // txdw1: queue = BE, macid 0, security type
     w = BIT(16);                   memcpy(d + 8,  &w, 4);   // txdw2: AGG_BREAK
     w = BIT(8);                    memcpy(d + 12, &w, 4);   // txdw3: USE_DRIVER_RATE
     w = rate | (6u << 18) | BIT(17); memcpy(d + 16, &w, 4); // txdw4: rate, retry limit 6
@@ -1365,6 +1430,10 @@ IOReturn RtlWifiDriver::txData(const uint8_t *frame, uint16_t len, uint8_t rate,
     snprintf(key, sizeof(key), "tx-ch%d%c-status", channel, tag); setProperty(key, (uint64_t)(uint32_t)r, 32);
     snprintf(key, sizeof(key), "tx-ch%d%c-bytes", channel, tag);  setProperty(key, (uint64_t)got, 32);
     return r;
+}
+
+IOReturn RtlWifiDriver::txData(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag) {
+    return txDataSec(frame, len, rate, channel, tag, 0, false);
 }
 
 // EAPOL-Key message 2 of the WPA2 four-way handshake: SNonce, our RSN IE, MIC over the whole EAPOL frame
@@ -1458,8 +1527,89 @@ void RtlWifiDriver::runHandshake(uint8_t ch) {
     IOReturn r4 = txEapolMsg4(ch, 'h');                                    // sent in the clear, before the keys are active
     setProperty("hs-msg4-status", (uint64_t)(uint32_t)r4, 32);
     installKeys((uint8_t)(fOwnRsn[7] & 0x0f), gtkId, gtk, ch);             // group cipher type from our RSN IE
+    fMsg3Retx = 0;
     rxProbe(ch, 'i');                                                      // protected data frames after the keys are in
+    setProperty("hs-msg3-retx", (uint64_t)fMsg3Retx, 32);                  // > 0: the router repeated message 3
+    if (fMsg3Retx > 0) {                                                   // answer the repeated message 3 once more
+        IOReturn r4b = txEapolMsg4(ch, 'm');
+        setProperty("hs-msg4b-status", (uint64_t)(uint32_t)r4b, 32);
+        fMsg3Retx = 0;
+    }
     setProperty("hs-status", "message 4 sent, keys installed");
+    runDhcpTest(ch);
+}
+
+static uint16_t ipChecksum(const uint8_t *p, size_t n) {
+    uint32_t s = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) s += (uint32_t)((p[i] << 8) | p[i + 1]);
+    while (s >> 16) s = (s & 0xffff) + (s >> 16);
+    return (uint16_t)~s;
+}
+
+// Encrypted transmit test: a broadcast DHCP Discover sent as a CCMP-protected data frame (to the AP).
+// An offer coming back proves: pairwise key accepted by the router, chip-side CCMP encryption and, when the
+// offer is a unicast frame, pairwise decryption in the chip.
+void RtlWifiDriver::runDhcpTest(uint8_t ch) {
+    uint8_t f[340];
+    memset(f, 0, sizeof(f));
+    f[0] = 0x08; f[1] = 0x41;                       // data frame, to DS, protected
+    memcpy(f + 4, fApBssid, 6);                     // addr1 = AP (receiver)
+    memcpy(f + 10, &fEfuse[0xd7], 6);               // addr2 = SA
+    memset(f + 16, 0xff, 6);                        // addr3 = DA: broadcast
+    static const uint8_t kSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00};   // LLC/SNAP, IPv4
+    memcpy(f + 24, kSnap, 8);
+    uint8_t *ip = f + 32;
+    const uint16_t bootpLen = 240 + 19;             // fixed part + options below
+    const uint16_t udpLen = 8 + bootpLen;
+    const uint16_t ipLen = 20 + udpLen;
+    ip[0] = 0x45; ip[2] = ipLen >> 8; ip[3] = ipLen & 0xff;
+    ip[8] = 64; ip[9] = 17;                         // TTL, UDP
+    memset(ip + 16, 0xff, 4);                       // dst 255.255.255.255, src 0.0.0.0
+    uint16_t cs = ipChecksum(ip, 20);
+    ip[10] = cs >> 8; ip[11] = cs & 0xff;
+    uint8_t *u = ip + 20;
+    u[1] = 68; u[3] = 67;                           // ports 68 -> 67
+    u[4] = udpLen >> 8; u[5] = udpLen & 0xff;       // UDP checksum 0 = none
+    uint8_t *b = u + 8;
+    b[0] = 1; b[1] = 1; b[2] = 6;                   // BOOTREQUEST, Ethernet, hlen 6
+    memcpy(b + 4, kDhcpXid, 4);
+    memcpy(b + 28, &fEfuse[0xd7], 6);               // chaddr; broadcast flag left 0: unicast reply expected
+    b[236] = 0x63; b[237] = 0x82; b[238] = 0x53; b[239] = 0x63;
+    uint8_t *o = b + 240;
+    *o++ = 53; *o++ = 1; *o++ = 1;                  // DHCP Discover
+    *o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, &fEfuse[0xd7], 6); o += 6;   // client id
+    *o++ = 55; *o++ = 4; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 15;         // parameter request list
+    *o++ = 255;
+    uint16_t flen = (uint16_t)(24 + 8 + ipLen);     // 319
+
+    fHaveOffer = false;
+    fStopOnOffer = true;
+    fRxLoops = 25;                                  // about 2.5 s per round (a beacon every ~100 ms keeps reads returning)
+    IOReturn r = kIOReturnSuccess;
+    int sent = 0;
+    for (int i = 0; i < 3 && !fHaveOffer; i++) {    // up to 3 tries: the first packet number may be rejected (unverified)
+        char tg = (char)('j' + i);
+        r = txDataSec(f, flen, 0x00, ch, tg, 0x00c00000, true);   // 1M CCK, AES
+        sent++;
+        rxProbe(ch, tg);
+    }
+    fStopOnOffer = false;
+    fRxLoops = 10;
+    setProperty("dhcp-sent", (uint64_t)sent, 8);
+    setProperty("dhcp-tx-status", (uint64_t)(uint32_t)r, 32);
+    setProperty("dhcp-offer", fHaveOffer ? kOSBooleanTrue : kOSBooleanFalse);
+    if (fHaveOffer) {
+        char s[24];
+        snprintf(s, sizeof(s), "%d.%d.%d.%d", fOfferIp[0], fOfferIp[1], fOfferIp[2], fOfferIp[3]);
+        setProperty("dhcp-offer-ip", s);
+        snprintf(s, sizeof(s), "%d.%d.%d.%d", fOfferSrv[0], fOfferSrv[1], fOfferSrv[2], fOfferSrv[3]);
+        setProperty("dhcp-server-ip", s);
+        setProperty("dhcp-offer-protected", fOfferProt ? kOSBooleanTrue : kOSBooleanFalse);
+        setProperty("dhcp-offer-group-addr", fOfferBcast ? kOSBooleanTrue : kOSBooleanFalse);
+        setProperty("hs-status", "DHCP offer received");
+    } else {
+        setProperty("hs-status", "keys installed, no DHCP offer");
+    }
 }
 
 // EAPOL-Key message 4 (final message): empty key data, secure + MIC + pairwise
@@ -1683,12 +1833,15 @@ bool RtlWifiDriver::start(IOService *provider) {
     fHaveMsg3 = false;
     fMsg3Len = 0;
     fStopOnMsg3 = false;
+    fRxLoops = 10;
+    fStopOnOffer = fHaveOffer = fOfferProt = fOfferBcast = false;
+    fMsg3Retx = 0;
     fApChannel = 0;
     fApIeLen = 0;
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v21");
+    setProperty("build-tag", "v22");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
