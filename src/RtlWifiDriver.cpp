@@ -2009,7 +2009,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     if (!startHardware(provider)) return false;          // radio bring-up, association, handshake and DHCP test as before
 
     OSObject *providerClass = provider->getProperty("IOClassNameOverride");   // keeps the network daemon from creating new
-    if (providerClass) setProperty(kIOProviderClassKey, providerClass);        // interface names on every start (as HoRNDIS)
+    if (providerClass) setProperty("IOProviderClass", providerClass);        // interface names on every start (as HoRNDIS)
 
     if (!createMediumTables()) { setProperty("netif-status", "medium tables failed"); return true; }
     if (!attachInterface((IONetworkInterface **)&fNetif, true)) {
