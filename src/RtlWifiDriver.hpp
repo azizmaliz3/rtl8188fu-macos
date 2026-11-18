@@ -64,6 +64,7 @@ class RtlWifiDriver : public IOService {
     bool     fStopOnOffer, fHaveOffer, fOfferProt, fOfferBcast;
     uint8_t  fOfferIp[4], fOfferSrv[4];
     uint32_t fMsg3Retx;
+    uint64_t fTxPn;
     IOReturn txEapolMsg2(uint8_t channel, char tag);
     void     runHandshake(uint8_t channel);
     IOReturn txEapolMsg4(uint8_t channel, char tag);

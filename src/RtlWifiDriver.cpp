@@ -1007,6 +1007,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
     uint32_t probeResp = 0, authResp = 0, authStatus = 0xffff;
     uint32_t assocResp = 0, assocStatus = 0xffff, assocAid = 0, eapol = 0, msg3Ok = 0, msg3Bad = 0;
     uint32_t prot = 0, decSnap = 0, secFirst = 0xff, swdecFirst = 0xff;
+    uint32_t ethArp = 0, ethIp4 = 0, ethIp6 = 0, ethOther = 0;
     uint32_t icvErr = 0, deauth = 0, deauthReason = 0xffff, dhcpReplies = 0, protMcs = 0xff, protIvLen = 0xff;
     char key[48];
 
@@ -1145,6 +1146,14 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                     uint32_t d2 = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
                     protIvLen = (d2 >> 18) & 0x3f;
                     protMcs = buf[12] & 0x7f;
+                    uint32_t dl = got > off ? got - off : 0;               // 802.11 header, IV and the first payload bytes
+                    if (dl > 96) dl = 96;
+                    snprintf(key, sizeof(key), "rx-ch%d%c-prot-first-bytes", channel, tag);
+                    setProperty(key, buf + off, dl);
+                }
+                if (off + hl + 8 + 8 <= got && memcmp(buf + off + hl + 8, kSnap, 3) == 0) {   // decrypted LLC: ethertype
+                    uint16_t et = (uint16_t)((buf[off + hl + 8 + 6] << 8) | buf[off + hl + 8 + 7]);
+                    if (et == 0x0806) ethArp++; else if (et == 0x0800) ethIp4++; else if (et == 0x86dd) ethIp6++; else ethOther++;
                 }
                 if (off + hl + 8 + 6 <= got && memcmp(buf + off + hl + 8, kSnap, 6) == 0) decSnap++;   // LLC after the 8-byte IV
             }
@@ -1238,6 +1247,10 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
     snprintf(key, sizeof(key), "rx-ch%d%c-auth-status", channel, tag); setProperty(key, (uint64_t)authStatus, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-proberesp", channel, tag); setProperty(key, (uint64_t)probeResp, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-icverr", channel, tag); setProperty(key, (uint64_t)icvErr, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-eth-arp", channel, tag); setProperty(key, (uint64_t)ethArp, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-eth-ip4", channel, tag); setProperty(key, (uint64_t)ethIp4, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-eth-ip6", channel, tag); setProperty(key, (uint64_t)ethIp6, 32);
+    snprintf(key, sizeof(key), "rx-ch%d%c-eth-other", channel, tag); setProperty(key, (uint64_t)ethOther, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-deauth", channel, tag); setProperty(key, (uint64_t)deauth, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-deauth-reason", channel, tag); setProperty(key, (uint64_t)deauthReason, 32);
     snprintf(key, sizeof(key), "rx-ch%d%c-dhcp-replies", channel, tag); setProperty(key, (uint64_t)dhcpReplies, 32);
@@ -1550,15 +1563,17 @@ static uint16_t ipChecksum(const uint8_t *p, size_t n) {
 // An offer coming back proves: pairwise key accepted by the router, chip-side CCMP encryption and, when the
 // offer is a unicast frame, pairwise decryption in the chip.
 void RtlWifiDriver::runDhcpTest(uint8_t ch) {
-    uint8_t f[340];
+    uint8_t f[352];
     memset(f, 0, sizeof(f));
     f[0] = 0x08; f[1] = 0x41;                       // data frame, to DS, protected
     memcpy(f + 4, fApBssid, 6);                     // addr1 = AP (receiver)
     memcpy(f + 10, &fEfuse[0xd7], 6);               // addr2 = SA
     memset(f + 16, 0xff, 6);                        // addr3 = DA: broadcast
+    // f[24..31]: CCMP header (IV) with the packet number, filled in before every send. mac80211 builds it in software
+    // when a key has IEEE80211_KEY_FLAG_GENERATE_IV (set by rtl8xxxu); the chip only encrypts and appends the MIC.
     static const uint8_t kSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00};   // LLC/SNAP, IPv4
-    memcpy(f + 24, kSnap, 8);
-    uint8_t *ip = f + 32;
+    memcpy(f + 32, kSnap, 8);
+    uint8_t *ip = f + 40;
     const uint16_t bootpLen = 240 + 19;             // fixed part + options below
     const uint16_t udpLen = 8 + bootpLen;
     const uint16_t ipLen = 20 + udpLen;
@@ -1580,27 +1595,36 @@ void RtlWifiDriver::runDhcpTest(uint8_t ch) {
     *o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, &fEfuse[0xd7], 6); o += 6;   // client id
     *o++ = 55; *o++ = 4; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 15;         // parameter request list
     *o++ = 255;
-    uint16_t flen = (uint16_t)(24 + 8 + ipLen);     // 319
+    uint16_t flen = (uint16_t)(24 + 8 + 8 + ipLen); // 327: header, CCMP header, LLC/SNAP, IP packet
 
     fHaveOffer = false;
     fStopOnOffer = true;
     fRxLoops = 25;                                  // about 2.5 s per round (a beacon every ~100 ms keeps reads returning)
     IOReturn r = kIOReturnSuccess;
     int sent = 0;
-    for (int i = 0; i < 3 && !fHaveOffer; i++) {    // up to 3 tries: the first packet number may be rejected (unverified)
+    char offerRound = 0;
+    for (int i = 0; i < 3 && !fHaveOffer; i++) {    // up to 3 tries; round 3 is a variant: destination = the AP itself, no group flag
         char tg = (char)('j' + i);
-        r = txDataSec(f, flen, 0x00, ch, tg, 0x00c00000, true);   // 1M CCK, AES
+        bool alt = (i == 2);
+        if (alt) memcpy(f + 16, fApBssid, 6); else memset(f + 16, 0xff, 6);
+        fTxPn++;                                    // one packet number per transmitted frame
+        f[24] = (uint8_t)fTxPn; f[25] = (uint8_t)(fTxPn >> 8); f[26] = 0; f[27] = 0x20;       // PN0, PN1, rsvd, ExtIV | key id 0
+        f[28] = (uint8_t)(fTxPn >> 16); f[29] = (uint8_t)(fTxPn >> 24); f[30] = (uint8_t)(fTxPn >> 32); f[31] = (uint8_t)(fTxPn >> 40);
+        r = txDataSec(f, flen, 0x00, ch, tg, 0x00c00000, !alt);   // 1M CCK, AES
         sent++;
         rxProbe(ch, tg);
+        if (fHaveOffer) offerRound = tg;
     }
     fStopOnOffer = false;
     fRxLoops = 10;
     setProperty("dhcp-sent", (uint64_t)sent, 8);
     setProperty("dhcp-tx-status", (uint64_t)(uint32_t)r, 32);
     setProperty("dhcp-offer", fHaveOffer ? kOSBooleanTrue : kOSBooleanFalse);
+    setProperty("dhcp-tx-pn-last", fTxPn, 32);
     if (fHaveOffer) {
         char s[24];
         snprintf(s, sizeof(s), "%d.%d.%d.%d", fOfferIp[0], fOfferIp[1], fOfferIp[2], fOfferIp[3]);
+        { char rd[2] = {offerRound, 0}; setProperty("dhcp-offer-round", rd); }
         setProperty("dhcp-offer-ip", s);
         snprintf(s, sizeof(s), "%d.%d.%d.%d", fOfferSrv[0], fOfferSrv[1], fOfferSrv[2], fOfferSrv[3]);
         setProperty("dhcp-server-ip", s);
@@ -1656,6 +1680,7 @@ void RtlWifiDriver::camWrite(uint8_t idx, uint8_t cipher, uint8_t keyId, bool gr
 // rtl8xxxu_set_key for the pairwise CCMP key (entry 0) and the group key (entry 1), then enable security
 void RtlWifiDriver::installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t *gtk16, uint8_t channel) {
     (void)channel;
+    fTxPn = 0;                                                              // CCMP packet number: first frame uses 1, like mac80211
     uint16_t cr = rd16(REG_CR);
     cr |= BIT(9);                                                           // CR_SECURITY_ENABLE
     wr16(REG_CR, cr);
@@ -1836,12 +1861,13 @@ bool RtlWifiDriver::start(IOService *provider) {
     fRxLoops = 10;
     fStopOnOffer = fHaveOffer = fOfferProt = fOfferBcast = false;
     fMsg3Retx = 0;
+    fTxPn = 0;
     fApChannel = 0;
     fApIeLen = 0;
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v22");
+    setProperty("build-tag", "v23");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
