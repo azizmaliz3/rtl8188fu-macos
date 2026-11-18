@@ -8,10 +8,10 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
 
-#define super IOService
+#define super IOEthernetController
 
 static int findIe(const uint8_t *ies, uint16_t len, uint8_t tag, const uint8_t **data);
-OSDefineMetaClassAndStructors(RtlWifiDriver, IOService)
+OSDefineMetaClassAndStructors(RtlWifiDriver, IOEthernetController)
 
 #ifndef BIT
 #define BIT(n) (1u << (n))
@@ -1688,6 +1688,7 @@ void RtlWifiDriver::installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t 
     camWrite(0, 4, 0, false, fApBssid, fPtk + 32);                          // CCMP (cipher 4), TK = PTK bytes 32..47
     camWrite(1, gtkCipher, gtkId, true, fApBssid, gtk16);
     setProperty("keys-installed", kOSBooleanTrue);
+    fKeysUp = true;
     setProperty("sec-cfg-readback", (uint64_t)rd8(0x0680), 8);
     setProperty("cr-after-keys", (uint64_t)rd16(REG_CR), 16);
 }
@@ -1850,7 +1851,7 @@ void RtlWifiDriver::scanAll() {
 
 // ---------- lifecycle ----------
 
-bool RtlWifiDriver::start(IOService *provider) {
+bool RtlWifiDriver::startHardware(IOService *provider) {
     fInterface = nullptr;
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     fHaveAp = false;
@@ -1862,12 +1863,15 @@ bool RtlWifiDriver::start(IOService *provider) {
     fStopOnOffer = fHaveOffer = fOfferProt = fOfferBcast = false;
     fMsg3Retx = 0;
     fTxPn = 0;
+    fNetif = nullptr;
+    fNetifEnabled = fKeysUp = false;
+    fNetTxDropped = 0;
     fApChannel = 0;
     fApIeLen = 0;
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v23");
+    setProperty("build-tag", "v24");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1995,6 +1999,101 @@ bool RtlWifiDriver::start(IOService *provider) {
     return true;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// Network interface. Patterns follow HoRNDIS (a USB IOEthernetController kext); this build only publishes the
+// interface: no packets are received, and every outgoing packet is dropped (counted in "netif-tx-dropped").
+// ---------------------------------------------------------------------------------------------------------------
+
+bool RtlWifiDriver::start(IOService *provider) {
+    if (!startHardware(provider)) return false;          // radio bring-up, association, handshake and DHCP test as before
+
+    OSObject *providerClass = provider->getProperty("IOClassNameOverride");   // keeps the network daemon from creating new
+    if (providerClass) setProperty(kIOProviderClassKey, providerClass);        // interface names on every start (as HoRNDIS)
+
+    if (!createMediumTables()) { setProperty("netif-status", "medium tables failed"); return true; }
+    if (!attachInterface((IONetworkInterface **)&fNetif, true)) {
+        setProperty("netif-status", "attachInterface failed");
+        return true;                                      // the radio test results stay readable in ioreg
+    }
+    setLinkStatus(kIONetworkLinkValid);                   // before the interface is published, as other drivers do
+    setProperty("netif-attached", kOSBooleanTrue);
+    if (fNetif) setProperty("netif-name", fNetif->getName());
+    setProperty("netif-status", "attached");
+    return true;
+}
+
+bool RtlWifiDriver::createMediumTables() {
+    OSDictionary *dict = OSDictionary::withCapacity(1);
+    if (!dict) return false;
+    IONetworkMedium *medium = IONetworkMedium::medium(kIOMediumEthernetAuto, 1000000);   // 1 Mbit/s: CCK rate in use
+    if (!medium) { dict->release(); return false; }
+    IONetworkMedium::addMedium(dict, medium);
+    medium->release();                                    // the dictionary holds a reference now
+    bool ok = publishMediumDictionary(dict) && setCurrentMedium(medium);
+    dict->release();
+    return ok;
+}
+
+IOOutputQueue *RtlWifiDriver::createOutputQueue() {
+    return IOGatedOutputQueue::withTarget(this, getWorkLoop(), 256);
+}
+
+IOReturn RtlWifiDriver::getHardwareAddress(IOEthernetAddress *addr) {
+    memcpy(addr->bytes, &fEfuse[0xd7], 6);                // MAC from the efuse
+    return kIOReturnSuccess;
+}
+
+IOReturn RtlWifiDriver::getPacketFilters(const OSSymbol *group, UInt32 *filters) const {
+    if (group == gIOEthernetWakeOnLANFilterGroup) { *filters = 0; return kIOReturnSuccess; }
+    if (group == gIONetworkFilterGroup) {
+        *filters = kIOPacketFilterUnicast | kIOPacketFilterBroadcast | kIOPacketFilterPromiscuous |
+                   kIOPacketFilterMulticast | kIOPacketFilterMulticastAll;
+        return kIOReturnSuccess;
+    }
+    return super::getPacketFilters(group, filters);
+}
+
+IOReturn RtlWifiDriver::selectMedium(const IONetworkMedium *medium) {
+    setSelectedMedium(medium);
+    return kIOReturnSuccess;
+}
+
+IOReturn RtlWifiDriver::setMulticastMode(bool) { return kIOReturnSuccess; }
+IOReturn RtlWifiDriver::setMulticastList(IOEthernetAddress *, UInt32) { return kIOReturnSuccess; }
+IOReturn RtlWifiDriver::setPromiscuousMode(bool) { return kIOReturnSuccess; }
+
+IOReturn RtlWifiDriver::enable(IONetworkInterface *) {
+    if (fNetifEnabled) return kIOReturnSuccess;
+    getOutputQueue()->setCapacity(256);
+    getOutputQueue()->start();
+    // Link is reported up only when the keys are installed (association and handshake done in start())
+    setLinkStatus((fKeysUp ? kIONetworkLinkActive : 0) | kIONetworkLinkValid, getCurrentMedium(), 1000000);
+    fNetifEnabled = true;
+    setProperty("netif-enabled", kOSBooleanTrue);
+    setProperty("netif-link-up", fKeysUp ? kOSBooleanTrue : kOSBooleanFalse);
+    return kIOReturnSuccess;
+}
+
+IOReturn RtlWifiDriver::disable(IONetworkInterface *) {
+    if (!fNetifEnabled) return kIOReturnSuccess;
+    getOutputQueue()->stop();
+    getOutputQueue()->flush();
+    getOutputQueue()->setCapacity(0);
+    setLinkStatus(kIONetworkLinkValid, 0);
+    fNetifEnabled = false;
+    setProperty("netif-enabled", kOSBooleanFalse);
+    return kIOReturnSuccess;
+}
+
+// Transmit is not implemented yet: free the packet and count it.
+UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
+    freePacket(packet);
+    fNetTxDropped++;
+    if (fNetTxDropped <= 50) setProperty("netif-tx-dropped", (uint64_t)fNetTxDropped, 32);
+    return kIOReturnOutputDropped;
+}
+
 bool RtlWifiDriver::willTerminate(IOService *provider, IOOptionBits options) {
     setProperty("will-terminate", (uint64_t)options, 32);
     return super::willTerminate(provider, options);
@@ -2010,6 +2109,7 @@ void RtlWifiDriver::stop(IOService *provider) {
     if (fPipeIn)   { fPipeIn->release();   fPipeIn = nullptr; }
     if (fPipeOut2) { fPipeOut2->release(); fPipeOut2 = nullptr; }
     if (fPipeOut3) { fPipeOut3->release(); fPipeOut3 = nullptr; }
+    if (fNetif) { fNetif->release(); fNetif = nullptr; }                  // as HoRNDIS::stop
     if (fInterface) { fInterface->close(this); fInterface = nullptr; }
     IOLog("RtlWifi: stopped\n");
     super::stop(provider);

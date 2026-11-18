@@ -1,13 +1,17 @@
 #ifndef RtlWifiDriver_hpp
 #define RtlWifiDriver_hpp
 #include <IOKit/IOService.h>
+#include <IOKit/network/IOEthernetController.h>
+#include <IOKit/network/IOEthernetInterface.h>
+#include <IOKit/network/IOGatedOutputQueue.h>
+#include <IOKit/network/IONetworkMedium.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
 
 struct RtlReg32Val;
 struct RtlRfRegVal;
 
-class RtlWifiDriver : public IOService {
+class RtlWifiDriver : public IOEthernetController {
     OSDeclareDefaultStructors(RtlWifiDriver)
     IOUSBHostInterface *fInterface;
     IOUSBHostPipe *fPipeIn;     // bulk IN  0x81
@@ -65,6 +69,12 @@ class RtlWifiDriver : public IOService {
     uint8_t  fOfferIp[4], fOfferSrv[4];
     uint32_t fMsg3Retx;
     uint64_t fTxPn;
+    // Network interface (IOEthernetController side)
+    bool     startHardware(IOService *provider);
+    bool     createMediumTables();
+    IOEthernetInterface *fNetif;
+    bool     fNetifEnabled, fKeysUp;
+    uint32_t fNetTxDropped;
     IOReturn txEapolMsg2(uint8_t channel, char tag);
     void     runHandshake(uint8_t channel);
     IOReturn txEapolMsg4(uint8_t channel, char tag);
@@ -101,5 +111,17 @@ public:
     void stop(IOService *provider) override;
     bool willTerminate(IOService *provider, IOOptionBits options) override;
     bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) override;
+
+    // IOEthernetController overrides
+    IOOutputQueue *createOutputQueue() override;
+    IOReturn getHardwareAddress(IOEthernetAddress *addr) override;
+    IOReturn getPacketFilters(const OSSymbol *group, UInt32 *filters) const override;
+    IOReturn enable(IONetworkInterface *netif) override;
+    IOReturn disable(IONetworkInterface *netif) override;
+    IOReturn selectMedium(const IONetworkMedium *medium) override;
+    IOReturn setMulticastMode(bool active) override;
+    IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) override;
+    IOReturn setPromiscuousMode(bool active) override;
+    UInt32   outputPacket(mbuf_t packet, void *param) override;
 };
 #endif
