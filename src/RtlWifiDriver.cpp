@@ -1095,6 +1095,12 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                         setProperty("ap-cap", (uint64_t)fApCap, 16);
                         fHaveAp = true;
                         fApChannel = channel;
+                        {                                          // the beacon's DS Parameter Set names the real channel;
+                            const uint8_t *dp;                     // neighbouring channels also hear a strong beacon
+                            int dl = findIe(fApIes, fApIeLen, 3, &dp);
+                            setProperty("ap-scan-channel", (uint64_t)channel, 8);
+                            if (dl >= 1 && dp[0] >= 1 && dp[0] <= 13) fApChannel = dp[0];
+                        }
                     }
                 }
                 if (!haveSsid) {
@@ -1874,7 +1880,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v24b");
+    setProperty("build-tag", "v24c");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
