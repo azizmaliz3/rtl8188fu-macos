@@ -1413,12 +1413,13 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     memcpy(f + n, group, 4); n += 4;
     f[n++] = 0x01; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x0f; f[n++] = 0xac; f[n++] = 0x04;   // pairwise: CCMP
     f[n++] = 0x01; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x0f; f[n++] = 0xac; f[n++] = 0x02;   // AKM: PSK
+    rsnCaps[0] = 0; rsnCaps[1] = 0;
     f[n++] = rsnCaps[0]; f[n++] = rsnCaps[1];
     memcpy(fOwnRsn, f + rsnStart, 22);
 
     l = findIe(fApIes, fApIeLen, 45, &p);           // HT capabilities, mirrored
     if (l == 26) { f[n++] = 45; f[n++] = 26; memcpy(f + n, p, 26); n += 26; }
-
+if (n + sizeof(rtl8188f::kWmmInfoIe) <= sizeof(f)) { memcpy(f + n, rtl8188f::kWmmInfoIe, sizeof(rtl8188f::kWmmInfoIe)); n += sizeof(rtl8188f::kWmmInfoIe); }
     setProperty("assoc-frame-len", (uint64_t)n, 16);
     return txMgmt(f, n, rate, channel, tag);
 }
@@ -1906,26 +1907,9 @@ void RtlWifiDriver::setBssidFilter(bool enable) {
 }
 
 IOReturn RtlWifiDriver::setChannelBw(uint8_t primaryCh, int8_t secOffset) {
-    if (secOffset == 0 || !fHt40Active) {
-        fHt40Active = false;
-        return setChannel20(primaryCh);
-    }
-    uint8_t centerCh = static_cast<uint8_t>(primaryCh + (secOffset > 0 ? 2 : -2));
-    if (centerCh < 3 || centerCh > 11) {
-        fHt40Active = false;
-        return setChannel20(primaryCh);
-    }
-    IOReturn r = setChannel20(centerCh);
-    if (r != kIOReturnSuccess) return r;
-    // Enable 40 MHz BB/RF mode (rtl8xxxu_8188f HT40 path)
-    wr32(0x0800, rd32(0x0800) | BIT(0));
-    wr32(0x0900, rd32(0x0900) | BIT(0));
-    wr8(0x0483, (secOffset > 0) ? 0x02 : 0x01); // REG_DATA_SC (upper/lower 20MHz subchannel)
-    uint32_t rf18 = readRfReg(0x18);
-    rf18 &= ~0x00C00u; // Clear 20MHz BW bits -> 40MHz
-    writeRfReg(0x18, rf18);
-    fHt40Active = true;
-    return kIOReturnSuccess;
+    (void)secOffset;
+    fHt40Active = false;
+    return setChannel20(primaryCh);
 }
 
 void RtlWifiDriver::handleGtkRekey(const uint8_t *eapol, size_t len) {
@@ -2031,7 +2015,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fPmkCache.clear(); fRxReorder.reset(0);
 
     if (!super::start(provider)) return false;
-    setProperty("build-tag", "v28-ultimate");
+    setProperty("build-tag", "v28.1-routerfix");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
 
