@@ -56,7 +56,7 @@ jobs:
           </plist>
           PLIST
           swiftc -O -target x86_64-apple-macos11.0 tools/rtl8188ctl.swift -framework IOKit -o build/Release/rtl8188ctl
-          codcesign --force --deep --sign - build/Release/RtlWifiMenuBar.app
+          codesign --force --deep --sign - build/Release/RtlWifiMenuBar.app
           lipo -info build/Release/RtlWifiMenuBar.app/Contents/MacOS/RtlWifiMenuBar build/Release/rtl8188ctl
           
       - name: Package Release Artifact
