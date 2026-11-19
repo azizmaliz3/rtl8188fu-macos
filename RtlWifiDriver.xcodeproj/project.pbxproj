@@ -8,12 +8,15 @@
 
 /* Begin PBXBuildFile section */
 		1A0000000000000000000001 /* RtlWifiDriver.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000002 /* RtlWifiDriver.cpp */; };
+		1A0000000000000000000021 /* RtlWifiUserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000022 /* RtlWifiUserClient.cpp */; };
 		1A0000000000000000000007 /* libkmod.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000006 /* libkmod.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		1A0000000000000000000002 /* RtlWifiDriver.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = RtlWifiDriver.cpp; sourceTree = "<group>"; };
 		1A0000000000000000000003 /* RtlWifiDriver.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = RtlWifiDriver.hpp; sourceTree = "<group>"; };
+		1A0000000000000000000022 /* RtlWifiUserClient.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = RtlWifiUserClient.cpp; sourceTree = "<group>"; };
+		1A0000000000000000000023 /* RtlWifiUserClient.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = RtlWifiUserClient.hpp; sourceTree = "<group>"; };
 		1A0000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A0000000000000000000005 /* RtlWifiDriver.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RtlWifiDriver.kext; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0000000000000000000006 /* libkmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libkmod.a; path = MacKernelSDK/Library/x86_64/libkmod.a; sourceTree = "<group>"; };
@@ -45,6 +48,8 @@
 			children = (
 				1A0000000000000000000002 /* RtlWifiDriver.cpp */,
 				1A0000000000000000000003 /* RtlWifiDriver.hpp */,
+				1A0000000000000000000022 /* RtlWifiUserClient.cpp */,
+				1A0000000000000000000023 /* RtlWifiUserClient.hpp */,
 				1A0000000000000000000004 /* Info.plist */,
 			);
 			path = src;
@@ -109,6 +114,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A0000000000000000000001 /* RtlWifiDriver.cpp in Sources */,
+				1A0000000000000000000021 /* RtlWifiUserClient.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -124,7 +130,7 @@
 				CLANG_CXX_LIBRARY = "libc++";
 				CODE_SIGN_IDENTITY = "";
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 0.0.1;
+				CURRENT_PROJECT_VERSION = 0.4.0;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -152,10 +158,12 @@
 				CLANG_CXX_LIBRARY = "libc++";
 				CODE_SIGN_IDENTITY = "";
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 0.0.1;
+				CURRENT_PROJECT_VERSION = 0.4.0;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				GCC_C_LANGUAGE_STANDARD = gnu11;
+				DEAD_CODE_STRIPPING = YES;
 				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 3;
 				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
 				KERNEL_FRAMEWORK_HEADERS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Library/x86_64";

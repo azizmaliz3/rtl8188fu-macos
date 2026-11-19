@@ -7,6 +7,13 @@
 #include <IOKit/network/IONetworkMedium.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOCommandGate.h>
+#include <IOKit/network/IONetworkStats.h>
+#include "RtlWifiShared.h"
+#include "RtlWifiDataPlane.hpp"
+#include "RtlWifiStability.hpp"
+#include "RtlWifiAsyncRing.hpp"
 
 struct RtlReg32Val;
 struct RtlRfRegVal;
@@ -78,7 +85,41 @@ class RtlWifiDriver : public IOEthernetController {
     bool     fNetifEnabled, fKeysUp;
     uint32_t fNetTxDropped;
     // Data path (v25): asynchronous receive on bulk-IN, transmit from outputPacket()
-    IOBufferMemoryDescriptor *fRxMd[2];
+    IOBufferMemoryDescriptor *fRxMd[rtl8188f::kRxRingSize];
+    RtlTxBeRing fTxBeRing;
+    RtlTxHiRing fTxHiRing;
+    rtl8188f::RtlDigController fDig;
+    rtl8188f::RtlLinkWatchdog fWatchdog;
+    rtl8188f::RtlThermalTracker fThermal;
+    rtl8188f::RtlPmkCache fPmkCache;
+    rtl8188f::RtlRxReorderWindow<mbuf_t> fRxReorder;
+    IONetworkStats *fNetStats;
+    bool     fIsEncrypted;
+    int8_t   fApSecOffset;
+    uint32_t fAmsduSubframes;
+    uint32_t fRoamCount;
+    IOReturn setChannelBw(uint8_t primaryCh, int8_t secOffset);
+    void     setBssidFilter(bool enable);
+    void     handleGtkRekey(const uint8_t *eapol, size_t len);
+    IOTimerEventSource *fWatchdogTimer;
+    uint8_t  fH2cBox;
+    bool     fHt40Active;
+    bool     fBeaconSeen;
+    uint32_t fUsbErrWindow;
+    uint32_t fGtkRekeyCount;
+    uint32_t fUsbStallRecoveries;
+    uint32_t fDriverState;
+    int32_t  fLastRssiDbm;
+    char     fTargetSsid[RTL_WIFI_MAX_SSID_LEN + 1];
+    uint8_t  fTargetSsidLen;
+    RtlWifiScanList fScanList;
+    void     sendH2c(const rtl8188f::H2cCommand &cmd);
+    void     txBeComplete(unsigned idx, IOReturn status);
+    void     txHiComplete(unsigned idx, IOReturn status);
+    static void txBeCompleteStatic(void *owner, void *param, IOReturn status, uint32_t bytes);
+    static void txHiCompleteStatic(void *owner, void *param, IOReturn status, uint32_t bytes);
+    void     onWatchdogTick(IOTimerEventSource *sender);
+    bool     connectToCurrentTarget();
     volatile int32_t fRxInflight;
     volatile bool    fRxRunning;
     uint32_t fRxErrRun;
@@ -90,7 +131,7 @@ class RtlWifiDriver : public IOEthernetController {
     void     submitRx(unsigned idx);
     void     rxComplete(unsigned idx, IOReturn status, uint32_t bytes);
     void     handleRx(const uint8_t *buf, uint32_t len);
-    void     rxFrame(const uint8_t *f, uint32_t len, uint32_t desc0);
+    bool     rxFrame(const uint8_t *f, uint32_t len, uint32_t desc0);
     static void rxCompleteStatic(void *owner, void *param, IOReturn status, uint32_t bytes);
     IOReturn txEapolMsg2(uint8_t channel, char tag);
     void     runHandshake(uint8_t channel);
@@ -140,5 +181,14 @@ public:
     IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) override;
     IOReturn setPromiscuousMode(bool active) override;
     UInt32   outputPacket(mbuf_t packet, void *param) override;
+
+    // IOUserClient runtime control API (used by RtlWifiMenuBar.app & rtl8188ctl)
+    IOReturn ucGetStatus(RtlWifiStatus *out);
+    IOReturn ucStartScan();
+    IOReturn ucGetScanResults(RtlWifiScanList *out);
+    IOReturn ucConnect(const RtlWifiConnectReq *req);
+    IOReturn ucDisconnect();
+    IOReturn ucGetDiagnostics(RtlWifiDiagnostics *out);
+    IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) override;
 };
 #endif

@@ -6,6 +6,17 @@
 
 namespace rtlcrypto {
 
+static inline void secure_zero(void *p, size_t n) {
+    volatile uint8_t *vp = static_cast<volatile uint8_t *>(p);
+    while (n--) *vp++ = 0;
+}
+
+static inline bool ct_equal(const uint8_t *a, const uint8_t *b, size_t n) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; ++i) diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+    return diff == 0;
+}
+
 struct Sha1 { uint32_t h[5]; uint64_t len; uint8_t buf[64]; uint32_t n; };
 
 static inline uint32_t rol32(uint32_t x, int s) { return (x << s) | (x >> (32 - s)); }
@@ -71,6 +82,7 @@ static inline void hmac_init(Hmac &h, const uint8_t *key, size_t klen) {
     for (int i = 0; i < 64; i++) { ip[i] = k[i] ^ 0x36; op[i] = k[i] ^ 0x5c; }
     sha1_init(h.inner); sha1_update(h.inner, ip, 64);
     sha1_init(h.outer); sha1_update(h.outer, op, 64);
+    secure_zero(k, sizeof(k)); secure_zero(ip, sizeof(ip)); secure_zero(op, sizeof(op));
 }
 
 static inline void hmac_mac(const Hmac &h, const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, uint8_t out[20]) {
@@ -105,6 +117,7 @@ static inline void pbkdf2_pmk(const char *pass, const uint8_t *ssid, size_t ssid
         memcpy(out + (block - 1) * 20, t, 20);
     }
     memcpy(pmk, out, 32);
+    secure_zero(out, sizeof(out)); secure_zero(&h, sizeof(h));
 }
 
 // IEEE 802.11i PRF: output = HMAC-SHA1(key, label || 0x00 || data || counter) blocks, truncated to outLen
@@ -229,8 +242,10 @@ static inline bool aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t i
         }
     }
     memcpy(out, R, n * 8);
-    for (int i = 0; i < 8; i++) if (A[i] != 0xa6) return false;
-    return true;
+    static const uint8_t kIv[8] = {0xa6,0xa6,0xa6,0xa6,0xa6,0xa6,0xa6,0xa6};
+    bool ok = ct_equal(A, kIv, 8);
+    secure_zero(&a, sizeof(a)); secure_zero(A, sizeof(A)); secure_zero(R, sizeof(R)); secure_zero(B, sizeof(B));
+    return ok;
 }
 
 } // namespace rtlcrypto

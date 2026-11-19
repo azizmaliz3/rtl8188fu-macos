@@ -11,6 +11,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
+#include <sys/random.h>
 
 #define super IOEthernetController
 
@@ -763,13 +764,14 @@ IOReturn RtlWifiDriver::initCalib() {
     v32 |= (6u << 4);
     W(0x0208, 4, v32);
     W(0x0228, 1, 6 << 1);                              // REG_DWBCN1_CTRL_8723B
+    // V27: Enable USB RXDMA aggregation (8 pages / timeout 4) for multi-packet bulk-IN bursts
     uint8_t aggCtrl = rd8(REG_TRXDMA_CTRL);
-    aggCtrl &= ~BIT(2);                                // TRXDMA_CTRL_RXDMA_AGG_EN
+    aggCtrl |= BIT(2);                                 // TRXDMA_CTRL_RXDMA_AGG_EN
     uint32_t aggRx = rd32(0x0280);                     // REG_RXDMA_AGG_PG_TH
     aggRx &= ~BIT(31);
-    aggRx &= ~0xFF0Fu;
+    aggRx = (aggRx & ~0xFF0Fu) | 0x0408u;
     uint8_t rxdmaMode = rd8(0x0290);
-    rxdmaMode &= ~BIT(1);
+    rxdmaMode |= BIT(1);
     W(REG_TRXDMA_CTRL, 1, aggCtrl);
     W(0x0280, 4, aggRx);
     W(0x0290, 1, rxdmaMode);
@@ -1053,11 +1055,10 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
             }
             if (fc0 == 0x80) {                         // beacon
                 beacons++;
-                if (!fHaveAp) {                        // test shortcut: look for the user's own router
-                    static const char kTestSsid[] = RTL_TEST_SSID;
+                if (!fHaveAp && fTargetSsidLen > 0) {
                     uint32_t ie2 = off + 24 + 12;
-                    if (ie2 + 2 <= got && buf[ie2] == 0 && buf[ie2 + 1] == sizeof(kTestSsid) - 1 &&
-                        ie2 + 2 + buf[ie2 + 1] <= got && memcmp(buf + ie2 + 2, kTestSsid, buf[ie2 + 1]) == 0) {
+                    if (ie2 + 2 <= got && buf[ie2] == 0 && buf[ie2 + 1] == fTargetSsidLen &&
+                        ie2 + 2 + buf[ie2 + 1] <= got && memcmp(buf + ie2 + 2, fTargetSsid, fTargetSsidLen) == 0) {
                         memcpy(fApBssid, buf + off + 16, 6);
                         uint32_t end = off + pktlen;               // frame end without the 4-byte FCS
                         if (end > got) end = got;
@@ -1367,8 +1368,8 @@ static int findIe(const uint8_t *ies, uint16_t len, uint8_t tag, const uint8_t *
 // AP's basic rate set is satisfied by construction. The RSN IE selects CCMP + PSK with the AP's group cipher.
 IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     if (!fHaveAp) return kIOReturnBadArgument;
-    static const char kTestSsid[] = RTL_TEST_SSID;
-    const uint8_t ssidLen = sizeof(kTestSsid) - 1;
+    if (fTargetSsidLen == 0) return kIOReturnBadArgument;
+    const uint8_t ssidLen = fTargetSsidLen;
     uint8_t f[200];
     memset(f, 0, sizeof(f));
     f[0] = 0x00;                                    // management, association request
@@ -1380,7 +1381,7 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     f[n++] = cap & 0xff; f[n++] = cap >> 8;
     f[n++] = 0x0a; f[n++] = 0x00;                   // listen interval 10
     f[n++] = 0x00; f[n++] = ssidLen;                // SSID IE
-    memcpy(f + n, kTestSsid, ssidLen); n += ssidLen;
+    memcpy(f + n, fTargetSsid, ssidLen); n += ssidLen;
 
     const uint8_t *p;
     int l = findIe(fApIes, fApIeLen, 1, &p);        // supported rates, mirrored
@@ -1493,16 +1494,7 @@ void RtlWifiDriver::runHandshake(uint8_t ch) {
     int attempt = 0;
     IOReturn r = kIOReturnSuccess;
     for (attempt = 1; attempt <= 4; attempt++) {
-        // Test shortcut, no random source: SNonce = HMAC-SHA1(PMK, MAC || ANonce) in two blocks
-        uint8_t d[38];
-        memcpy(d, &fEfuse[0xd7], 6);
-        memcpy(d + 6, fAnonce, 32);
-        uint8_t s1[20], s2[20];
-        rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s1);
-        d[0] ^= 0x5a;
-        rtlcrypto::hmac_sha1(fPmk, 32, d, sizeof(d), s2);
-        memcpy(fSnonce, s1, 20);
-        memcpy(fSnonce + 20, s2, 12);
+        read_random(fSnonce, sizeof(fSnonce)); // V28: cryptographic SNonce
         rtlcrypto::derive_ptk(fPmk, fApBssid, &fEfuse[0xd7], fAnonce, fSnonce, fPtk);
         fHavePtk = true;
         fHaveMsg3 = false;
@@ -1560,7 +1552,7 @@ void RtlWifiDriver::runHandshake(uint8_t ch) {
         fMsg3Retx = 0;
     }
     setProperty("hs-status", "message 4 sent, keys installed");
-    runDhcpTest(ch);
+    // V28: skipped 7.5s dummy DHCP test so macOS configd acquires IP immediately
 }
 
 static uint16_t ipChecksum(const uint8_t *p, size_t n) {
@@ -1701,6 +1693,14 @@ void RtlWifiDriver::installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t 
     camWrite(1, gtkCipher, gtkId, true, fApBssid, gtk16);
     setProperty("keys-installed", kOSBooleanTrue);
     fKeysUp = true;
+    fDriverState = kRtlStateConnected;
+    // V27: Activate 8051 H2C firmware rate adaptation (MCS0-MCS7 + SGI), keepalive, and ADDBA
+    sendH2c(rtl8188f::buildH2cMediaStatus(true, 0));
+    sendH2c(rtl8188f::buildH2cRaMask(0, fHt40Active, true));
+    sendH2c(rtl8188f::buildH2cKeepAlive(true, 10));
+    uint8_t addba[40];
+    uint16_t alen = rtl8188f::buildAddbaRequest(addba, sizeof(addba), fApBssid, &fEfuse[0xd7], 1, 0, 64);
+    if (alen > 0) txMgmt(addba, alen, 0x04, fApChannel, 0);
     setProperty("sec-cfg-readback", (uint64_t)rd8(0x0680), 8);
     setProperty("cr-after-keys", (uint64_t)rd16(REG_CR), 16);
 }
@@ -1847,6 +1847,20 @@ void RtlWifiDriver::scanAll() {
     }
     md->release();
 
+    memset(&fScanList, 0, sizeof(fScanList));
+    fScanList.abiVersion = RTL_WIFI_ABI_VERSION;
+    fScanList.count = (n > RTL_WIFI_MAX_SCAN_COUNT) ? RTL_WIFI_MAX_SCAN_COUNT : n;
+    for (unsigned k = 0; k < fScanList.count; k++) {
+        memcpy(fScanList.entries[k].bssid, list[k].bssid, 6);
+        fScanList.entries[k].channel = list[k].ch;
+        fScanList.entries[k].security = (list[k].sec >= 2) ? kRtlSecWpa2Psk : kRtlSecOpen;
+        fScanList.entries[k].rssiDbm = -60;
+        size_t sl = strlen(list[k].ssid);
+        if (sl > RTL_WIFI_MAX_SSID_LEN) sl = RTL_WIFI_MAX_SSID_LEN;
+        fScanList.entries[k].ssidLen = (uint8_t)sl;
+        memcpy(fScanList.entries[k].ssid, list[k].ssid, sl);
+        fScanList.entries[k].htCapable = 1;
+    }
     static const char *kSec[] = {"open", "WEP", "WPA", "WPA2"};
     setProperty("scan-count", (uint64_t)n, 32);
     setProperty("scan-frames", (uint64_t)frames, 32);
@@ -1863,155 +1877,194 @@ void RtlWifiDriver::scanAll() {
 
 // ---------- lifecycle ----------
 
+
+
+void RtlWifiDriver::sendH2c(const rtl8188f::H2cCommand &cmd) {
+    for (int i = 0; i < 50; ++i) {
+        if ((rd8(rtl8188f::kRegHmetfr) & (1u << fH2cBox)) == 0) break;
+        IODelay(100);
+    }
+    wr16(static_cast<uint16_t>(rtl8188f::kRegHmeboxExt0 + 2u * fH2cBox), cmd.ext);
+    wr32(static_cast<uint16_t>(rtl8188f::kRegHmebox0 + 4u * fH2cBox), cmd.cmd);
+    fH2cBox = (fH2cBox + 1u) & 3u;
+}
+
+void RtlWifiDriver::setBssidFilter(bool enable) {
+    uint32_t rcr = rd32(rtl8188f::kRegRcr);
+    if (enable && fHaveAp) {
+        for (int i = 0; i < 6; ++i) wr8(static_cast<uint16_t>(rtl8188f::kRegBssid + i), fApBssid[i]);
+        rcr |= rtl8188f::kRcrCbssidData | rtl8188f::kRcrCbssidBcn;
+    } else {
+        rcr &= ~(rtl8188f::kRcrCbssidData | rtl8188f::kRcrCbssidBcn);
+    }
+    wr32(rtl8188f::kRegRcr, rcr);
+}
+
+IOReturn RtlWifiDriver::setChannelBw(uint8_t primaryCh, int8_t secOffset) {
+    if (secOffset == 0 || !fHt40Active) {
+        fHt40Active = false;
+        return setChannel20(primaryCh);
+    }
+    uint8_t centerCh = static_cast<uint8_t>(primaryCh + (secOffset > 0 ? 2 : -2));
+    if (centerCh < 3 || centerCh > 11) {
+        fHt40Active = false;
+        return setChannel20(primaryCh);
+    }
+    IOReturn r = setChannel20(centerCh);
+    if (r != kIOReturnSuccess) return r;
+    // Enable 40 MHz BB/RF mode (rtl8xxxu_8188f HT40 path)
+    wr32(0x0800, rd32(0x0800) | BIT(0));
+    wr32(0x0900, rd32(0x0900) | BIT(0));
+    wr8(0x0483, (secOffset > 0) ? 0x02 : 0x01); // REG_DATA_SC (upper/lower 20MHz subchannel)
+    uint32_t rf18 = readRfReg(0x18);
+    rf18 &= ~0x00C00u; // Clear 20MHz BW bits -> 40MHz
+    writeRfReg(0x18, rf18);
+    fHt40Active = true;
+    return kIOReturnSuccess;
+}
+
+void RtlWifiDriver::handleGtkRekey(const uint8_t *eapol, size_t len) {
+    auto res = rtl8188f::unwrapEapolGroupKeyMsg1(eapol, len, fPtk);
+    if (!res.ok) return;
+    camWrite(1, fGtkCipher, res.gtkId, true, fApBssid, res.gtk16);
+    fGtkRekeyCount++;
+
+    // Reply with encrypted EAPOL Group Key Msg 2
+    uint8_t frame[42 + 99];
+    uint8_t ethHdr[14]{};
+    memcpy(ethHdr, fApBssid, 6);
+    ethHdr[12] = 0x88; ethHdr[13] = 0x8E;
+    fTxPn++;
+    uint16_t hlen = rtl8188f::writeQosDataHeader(frame, ethHdr, fApBssid, &fEfuse[0xd7], true, fTxPn, 6);
+    uint16_t elen = rtl8188f::buildEapolGroupKeyMsg2(frame + hlen, sizeof(frame) - hlen, res.replayCounter, fPtk);
+    if (elen > 0) {
+        txDataSec(frame, static_cast<uint16_t>(hlen + elen), 0x04, fApChannel, 0, rtl8188f::kTxDw1SecCcmp, false);
+    }
+    rtlcrypto::secure_zero(&res, sizeof(res));
+}
+
+bool RtlWifiDriver::connectToCurrentTarget() {
+    if (!fPipeIn || fTargetSsidLen == 0) return false;
+    setBssidFilter(false);
+    fDriverState = kRtlStateConnecting;
+    fHaveAp = false;
+    fHaveMsg1 = fHaveMsg3 = fNewMsg1 = false;
+    fRxReorder.reset(0);
+
+    // Passive-first on regulatory channels 12-13, active on 1-11
+    static const uint8_t kProbeCh[] = {1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
+    for (unsigned k = 0; k < sizeof(kProbeCh); k++) {
+        uint8_t ch = kProbeCh[k];
+        if (setChannel20(ch) != kIOReturnSuccess) continue;
+        if (ch <= 11) {
+            for (int t = 0; t < 2; t++) { txProbeRequest(ch, 0x00, 0); IOSleep(8); }
+        }
+        rxProbe(ch, 'a');
+        if (fHaveAp) break;
+    }
+    if (!fHaveAp) { fDriverState = kRtlStateDisconnected; return false; }
+
+    fApSecOffset = rtl8188f::parseHtOpSecondaryOffset(fApIes, fApIeLen);
+    if (setChannelBw(fApChannel, fHt40Active ? fApSecOffset : 0) != kIOReturnSuccess) {
+        fDriverState = kRtlStateDisconnected;
+        return false;
+    }
+
+    for (int t = 0; t < 2; t++) { txAuth(fApChannel, 0x04, 0); IOSleep(10); }
+    rxProbe(fApChannel, 'e');
+    for (int t = 0; t < 2; t++) { txAuth(fApChannel, 0x00, 0); IOSleep(10); }
+    rxProbe(fApChannel, 'c');
+    txAssoc(fApChannel, 0x00, 0);
+    IOSleep(10);
+
+    if (fIsEncrypted) {
+        fStopOnMsg1 = true;
+        rxProbe(fApChannel, 'f');
+        fStopOnMsg1 = false;
+        runHandshake(fApChannel);
+    } else {
+        // Open (unencrypted) network: skip 4-way handshake & activate H2C RA directly!
+        fKeysUp = true;
+        fDriverState = kRtlStateConnected;
+        sendH2c(rtl8188f::buildH2cMediaStatus(true, 0));
+        sendH2c(rtl8188f::buildH2cRaMask(0, fHt40Active, true));
+        sendH2c(rtl8188f::buildH2cKeepAlive(true, 10));
+    }
+
+    if (fKeysUp) {
+        setBssidFilter(true); // Drop off-network traffic in silicon!
+        uint64_t bps = fHt40Active ? 150000000ULL : 72200000ULL;
+        setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, getCurrentMedium(), bps);
+        if (fNetifEnabled) startRx();
+        return true;
+    }
+    fDriverState = kRtlStateDisconnected;
+    return false;
+}
+
 bool RtlWifiDriver::startHardware(IOService *provider) {
     fInterface = nullptr;
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
-    fHaveAp = false;
-    fHavePmk = fHavePtk = fHaveMsg1 = fStopOnMsg1 = false;
-    fHaveMsg3 = false;
-    fMsg3Len = 0;
-    fStopOnMsg3 = false;
-    fRxLoops = 10;
-    fStopOnOffer = fHaveOffer = fOfferProt = fOfferBcast = false;
-    fMsg3Retx = 0;
-    fTxPn = 0;
-    fNetif = nullptr;
-    fNetifEnabled = fKeysUp = false;
+    fHaveAp = false; fHavePmk = fHavePtk = fHaveMsg1 = fStopOnMsg1 = false;
+    fHaveMsg3 = false; fMsg3Len = 0; fStopOnMsg3 = false;
+    fRxLoops = 10; fStopOnOffer = fHaveOffer = fOfferProt = fOfferBcast = false;
+    fMsg3Retx = 0; fTxPn = 0; fNetif = nullptr; fNetStats = nullptr;
+    fNetifEnabled = fKeysUp = false; fIsEncrypted = true; fApSecOffset = 0;
     fNetTxDropped = 0;
-    fRxMd[0] = fRxMd[1] = nullptr;
-    fRxInflight = 0;
-    fRxRunning = false;
-    fRxErrRun = 0;
-    fTxFrame = nullptr;
-    fGtkCipher = 0;
+    for (uint32_t i = 0; i < rtl8188f::kRxRingSize; ++i) fRxMd[i] = nullptr;
+    fRxInflight = 0; fRxRunning = false; fRxErrRun = 0;
+    fTxFrame = nullptr; fGtkCipher = 0;
     fNetTxPackets = fNetTxErrors = fNetRxPackets = fNetRxDropped = 0;
-    fApChannel = 0;
-    fApIeLen = 0;
-    fApCap = 0;
-    if (!super::start(provider)) return false;
-    setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v25");
-    fInterface = OSDynamicCast(IOUSBHostInterface, provider);
-    if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
-    if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
+    fApChannel = 0; fApIeLen = 0; fApCap = 0;
+    fWatchdogTimer = nullptr; fH2cBox = 0; fHt40Active = false; fBeaconSeen = false;
+    fUsbErrWindow = 0; fGtkRekeyCount = 0; fUsbStallRecoveries = 0;
+    fAmsduSubframes = 0; fRoamCount = 0;
+    fDriverState = kRtlStateDisconnected; fLastRssiDbm = -65;
+    memset(fTargetSsid, 0, sizeof(fTargetSsid)); fTargetSsidLen = 0;
+    memset(&fScanList, 0, sizeof(fScanList)); fScanList.abiVersion = RTL_WIFI_ABI_VERSION;
+    fDig.reset(); fWatchdog.reset(); fThermal.setBaseline(0x20);
+    fPmkCache.clear(); fRxReorder.reset(0);
 
-    // Bulk pipes from the configuration descriptor: IN 0x81, OUT 0x02, OUT 0x03
+    if (!super::start(provider)) return false;
+    setProperty("build-tag", "v28-ultimate");
+    fInterface = OSDynamicCast(IOUSBHostInterface, provider);
+    if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
+
     fPipeIn   = fInterface->copyPipe(0x81);
     fPipeOut2 = fInterface->copyPipe(0x02);
     fPipeOut3 = fInterface->copyPipe(0x03);
-    setProperty("pipe-in-0x81", fPipeIn ? kOSBooleanTrue : kOSBooleanFalse);
-    setProperty("pipe-out-0x02", fPipeOut2 ? kOSBooleanTrue : kOSBooleanFalse);
-    setProperty("pipe-out-0x03", fPipeOut3 ? kOSBooleanTrue : kOSBooleanFalse);
+    fChipCut  = (uint8_t)((rd32(0x00F0) & 0xf000) >> 12);
 
-    uint32_t sysCfg = rd32(0x00F0);
-    fChipCut = (uint8_t)((sysCfg & 0xf000) >> 12);   // SYS_CFG_CHIP_VERSION_MASK
-    setProperty("sys-cfg", (uint64_t)sysCfg, 32);
-    setProperty("chip-cut", (uint64_t)fChipCut, 8);
-
-    bool chainOk = false;
-    IOReturn r = powerOn();
-    setProperty("power-on-status", (uint64_t)(uint32_t)r, 32);
-    setProperty("fsmco-after-power-on", (uint64_t)rd32(REG_APS_FSMCO), 32);
-    if (r != kIOReturnSuccess) return true;   // stay attached so properties can be read
-
-    // Queue setup, in the reference order (before the firmware download)
+    if (powerOn() != kIOReturnSuccess) return true;
     configEndpoints((fPipeOut2 ? 1 : 0) + (fPipeOut3 ? 1 : 0));
-    setProperty("ep-tx-count", (uint64_t)fEpTxCount, 8);
     initQueueReservedPage();
-    r = initQueuePriority();
-    setProperty("queue-priority-status", (uint64_t)(uint32_t)r, 32);
-    setProperty("rqpn-npq-readback", (uint64_t)rd32(REG_RQPN_NPQ), 32);
-    setProperty("rqpn-readback", (uint64_t)rd32(REG_RQPN), 32);
-    setProperty("trxdma-ctrl-readback", (uint64_t)rd16(REG_TRXDMA_CTRL), 16);
+    initQueuePriority();
+    wr16(REG_TRXFF_BNDY + 2, 0x3f7f);
 
-    wr16(REG_TRXFF_BNDY + 2, 0x3f7f);         // rtl8188fu_fops.trxff_boundary
-    setProperty("trxff-bndy-hi-readback", (uint64_t)rd16(REG_TRXFF_BNDY + 2), 16);
+    if (downloadFirmware() != kIOReturnSuccess) return true;
+    if (startFirmware() != kIOReturnSuccess) return true;
+    if (initMac() != kIOReturnSuccess) return true;
+    if (initPhyBb() != kIOReturnSuccess) return true;
+    if (initPhyRf() != kIOReturnSuccess) return true;
+    if (postRfInit() != kIOReturnSuccess) return true;
+    if (initMacTail() != kIOReturnSuccess) return true;
 
-    r = downloadFirmware();
-    setProperty("fw-dl-status", (uint64_t)(uint32_t)r, 32);
-    setProperty("mcu-fw-dl-reg-after-dl", (uint64_t)rd32(REG_MCU_FW_DL), 32);
-    if (r != kIOReturnSuccess) return true;
-
-    r = startFirmware();
-    setProperty("fw-start-status", (uint64_t)(uint32_t)r, 32);
-    setProperty("mcu-fw-dl-reg-final", (uint64_t)rd32(REG_MCU_FW_DL), 32);
-
-    if (r == kIOReturnSuccess) {
-        r = initMac();
-        setProperty("init-mac-status", (uint64_t)(uint32_t)r, 32);
-        if (r == kIOReturnSuccess) {
-            r = initPhyBb();
-            setProperty("init-phy-bb-status", (uint64_t)(uint32_t)r, 32);
-            if (r == kIOReturnSuccess) {
-                r = initPhyRf();
-                setProperty("init-phy-rf-status", (uint64_t)(uint32_t)r, 32);
-                if (r == kIOReturnSuccess) {
-                    r = postRfInit();
-                    setProperty("post-rf-init-status", (uint64_t)(uint32_t)r, 32);
-                    if (r == kIOReturnSuccess) {
-                        r = initMacTail();
-                        setProperty("mac-tail-status", (uint64_t)(uint32_t)r, 32);
-                        chainOk = (r == kIOReturnSuccess);
-                    }
-                }
-            }
-        }
-    }
-
-    r = readEfuse();
-    bool efuseOk = (r == kIOReturnSuccess);
-    setProperty("efuse-status", (uint64_t)(uint32_t)r, 32);
-    setProperty("efuse-map", fEfuse, sizeof(fEfuse));
-    uint16_t rtlId = (uint16_t)(fEfuse[0] | (fEfuse[1] << 8));
-    setProperty("efuse-rtl-id", (uint64_t)rtlId, 16);      // expected 0x8129 = 33065
-    char mac[20];
-    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-             fEfuse[0xd7], fEfuse[0xd8], fEfuse[0xd9],
-             fEfuse[0xda], fEfuse[0xdb], fEfuse[0xdc]);
-    setProperty("mac-address-str", mac);
-
-    if (chainOk && efuseOk && rtlId == 0x8129) {
-        setCrystalCap(fEfuse[0xb9] & 0x3f);                // efuse xtal_k
-        r = initCalib();
-        setProperty("calib-status", (uint64_t)(uint32_t)r, 32);
-        if (r == kIOReturnSuccess) {
+    if (readEfuse() == kIOReturnSuccess && (uint16_t)(fEfuse[0] | (fEfuse[1] << 8)) == 0x8129) {
+        setCrystalCap(fEfuse[0xb9] & 0x3f);
+        fThermal.setBaseline(fEfuse[0xb8]);
+        if (initCalib() == kIOReturnSuccess) {
             initStatistics();
-            r = setChannel20(6);
-            setProperty("set-channel-status", (uint64_t)(uint32_t)r, 32);
-            if (r == kIOReturnSuccess) {
-                setStationMode();
-                static const uint8_t kProbeCh[] = {1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10};   // find the test network's beacon; stop when found
-                for (unsigned k = 0; k < sizeof(kProbeCh); k++) {
-                    uint8_t ch = kProbeCh[k];
-                    if (setChannel20(ch) != kIOReturnSuccess) continue;
-                    for (int t = 0; t < 3; t++) { txProbeRequest(ch, 0x00, 'a'); IOSleep(10); }
-                    rxProbe(ch, 'a');
-                    if (fHaveAp) break;
-                }
-                setProperty("ap-found", fHaveAp ? kOSBooleanTrue : kOSBooleanFalse);
-                if (fHaveAp) {
-                    char bs[20];
-                    snprintf(bs, sizeof(bs), "%02x:%02x:%02x:%02x:%02x:%02x",
-                             fApBssid[0], fApBssid[1], fApBssid[2], fApBssid[3], fApBssid[4], fApBssid[5]);
-                    setProperty("ap-bssid", bs);
-                    setProperty("ap-channel", (uint64_t)fApChannel, 8);
-                    selfTest();
-                    if (strcmp(RTL_TEST_PASSPHRASE, "CHANGE_ME") != 0 && strlen(RTL_TEST_PASSPHRASE) >= 8) {
-                        rtlcrypto::pbkdf2_pmk(RTL_TEST_PASSPHRASE, (const uint8_t *)RTL_TEST_SSID, sizeof(RTL_TEST_SSID) - 1, fPmk);
-                        fHavePmk = true;
-                    }
-                    setProperty("passphrase-set", fHavePmk ? kOSBooleanTrue : kOSBooleanFalse);
-                    if (setChannel20(fApChannel) == kIOReturnSuccess) {
-                        for (int t = 0; t < 3; t++) { txAuth(fApChannel, 0x04, 'e'); IOSleep(10); }   // 6M OFDM first
-                        rxProbe(fApChannel, 'e');
-                        for (int t = 0; t < 3; t++) { txAuth(fApChannel, 0x00, 'c'); IOSleep(10); }   // 1M CCK
-                        rxProbe(fApChannel, 'c');
-                        for (int t = 0; t < 1; t++) { txAssoc(fApChannel, 0x00, 'f'); IOSleep(10); }  // association, 1M CCK
-                        fStopOnMsg1 = true;
-                        rxProbe(fApChannel, 'f');
-                        fStopOnMsg1 = false;
-                        runHandshake(fApChannel);
-                    }
+            setChannel20(6);
+            setStationMode();
+            if (RTL_TEST_SSID[0] != '\0' && strcmp(RTL_TEST_PASSPHRASE, "CHANGE_ME") != 0 && strlen(RTL_TEST_PASSPHRASE) >= 8) {
+                size_t sl = strlen(RTL_TEST_SSID);
+                if (sl <= RTL_WIFI_MAX_SSID_LEN) {
+                    memcpy(fTargetSsid, RTL_TEST_SSID, sl);
+                    fTargetSsidLen = (uint8_t)sl;
+                    fIsEncrypted = true;
+                    rtlcrypto::pbkdf2_pmk(RTL_TEST_PASSPHRASE, (const uint8_t *)fTargetSsid, fTargetSsidLen, fPmk);
+                    fHavePmk = true;
+                    connectToCurrentTarget();
                 }
             }
         }
@@ -2019,49 +2072,72 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     return true;
 }
 
-
-// ---------------------------------------------------------------------------------------------------------------
-// Network interface. Patterns follow HoRNDIS (a USB IOEthernetController kext); this build only publishes the
-// interface: no packets are received, and every outgoing packet is dropped (counted in "netif-tx-dropped").
-// ---------------------------------------------------------------------------------------------------------------
+static IOPMPowerState kRtlPowerStates[2] = {
+    { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }
+};
 
 bool RtlWifiDriver::start(IOService *provider) {
-    if (!startHardware(provider)) return false;          // radio bring-up, association, handshake and DHCP test as before
-    fTxFrame = (uint8_t *)IOMalloc(1600);                // frame buffer for outputPacket()
+    if (!startHardware(provider)) return false;
+    if (!fTxBeRing.init() || !fTxHiRing.init()) return false;
 
-    OSObject *providerClass = provider->getProperty("IOClassNameOverride");   // keeps the network daemon from creating new
-    if (providerClass) setProperty("IOProviderClass", providerClass);        // interface names on every start (as HoRNDIS)
+    OSObject *providerClass = provider->getProperty("IOClassNameOverride");
+    if (providerClass) setProperty("IOProviderClass", providerClass);
 
-    if (!createMediumTables()) { setProperty("netif-status", "medium tables failed"); return true; }
-    if (!attachInterface((IONetworkInterface **)&fNetif, true)) {
-        setProperty("netif-status", "attachInterface failed");
-        return true;                                      // the radio test results stay readable in ioreg
+    if (!createMediumTables()) return true;
+    if (!attachInterface((IONetworkInterface **)&fNetif, true)) return true;
+    if (fNetif) {
+        IONetworkData *nd = fNetif->getNetworkData(kIONetworkStatsKey);
+        if (nd) fNetStats = static_cast<IONetworkStats *>(nd->getBuffer());
     }
-    setLinkStatus(kIONetworkLinkValid);                   // before the interface is published, as other drivers do
-    setProperty("netif-attached", kOSBooleanTrue);
-    if (fNetif) setProperty("netif-name", fNetif->getName());
-    setProperty("netif-status", "attached");
+    setLinkStatus(kIONetworkLinkValid);
+
+    PMinit();
+    provider->joinPMtree(this);
+    registerPowerDriver(this, kRtlPowerStates, 2);
+
+    if (IOWorkLoop *wl = getWorkLoop()) {
+        fWatchdogTimer = IOTimerEventSource::timerEventSource(
+            this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &RtlWifiDriver::onWatchdogTick));
+        if (fWatchdogTimer) {
+            wl->addEventSource(fWatchdogTimer);
+            fWatchdogTimer->setTimeoutMS(2000);
+        }
+    }
+    registerService();
     return true;
+}
+
+IOReturn RtlWifiDriver::setPowerState(unsigned long powerStateOrdinal, IOService *) {
+    if (powerStateOrdinal == 0) {
+        // Entering macOS sleep: stop RX and drain queues cleanly
+        stopRx();
+        if (IOOutputQueue *q = getOutputQueue()) q->stop();
+    } else if (fNetifEnabled) {
+        if (IOOutputQueue *q = getOutputQueue()) q->start();
+        if (fKeysUp) startRx();
+    }
+    return kIOPMAckImplied;
 }
 
 bool RtlWifiDriver::createMediumTables() {
-    OSDictionary *dict = OSDictionary::withCapacity(1);
+    OSDictionary *dict = OSDictionary::withCapacity(2);
     if (!dict) return false;
-    IONetworkMedium *medium = IONetworkMedium::medium(kIOMediumEthernetAuto, 1000000);   // 1 Mbit/s: CCK rate in use
-    if (!medium) { dict->release(); return false; }
-    IONetworkMedium::addMedium(dict, medium);
-    medium->release();                                    // the dictionary holds a reference now
-    bool ok = publishMediumDictionary(dict) && setCurrentMedium(medium);
+    IONetworkMedium *mAuto = IONetworkMedium::medium(kIOMediumEthernetAuto, 150000000ULL);
+    if (!mAuto) { dict->release(); return false; }
+    IONetworkMedium::addMedium(dict, mAuto);
+    mAuto->release();
+    bool ok = publishMediumDictionary(dict) && setCurrentMedium(mAuto);
     dict->release();
     return ok;
 }
 
 IOOutputQueue *RtlWifiDriver::createOutputQueue() {
-    return IOGatedOutputQueue::withTarget(this, getWorkLoop(), 256);
+    return IOGatedOutputQueue::withTarget(this, getWorkLoop(), 512);
 }
 
 IOReturn RtlWifiDriver::getHardwareAddress(IOEthernetAddress *addr) {
-    memcpy(addr->bytes, &fEfuse[0xd7], 6);                // MAC from the efuse
+    memcpy(addr->bytes, &fEfuse[0xd7], 6);
     return kIOReturnSuccess;
 }
 
@@ -2075,25 +2151,19 @@ IOReturn RtlWifiDriver::getPacketFilters(const OSSymbol *group, UInt32 *filters)
     return super::getPacketFilters(group, filters);
 }
 
-IOReturn RtlWifiDriver::selectMedium(const IONetworkMedium *medium) {
-    setSelectedMedium(medium);
-    return kIOReturnSuccess;
-}
-
+IOReturn RtlWifiDriver::selectMedium(const IONetworkMedium *medium) { setSelectedMedium(medium); return kIOReturnSuccess; }
 IOReturn RtlWifiDriver::setMulticastMode(bool) { return kIOReturnSuccess; }
 IOReturn RtlWifiDriver::setMulticastList(IOEthernetAddress *, UInt32) { return kIOReturnSuccess; }
 IOReturn RtlWifiDriver::setPromiscuousMode(bool) { return kIOReturnSuccess; }
 
 IOReturn RtlWifiDriver::enable(IONetworkInterface *) {
     if (fNetifEnabled) return kIOReturnSuccess;
-    getOutputQueue()->setCapacity(256);
+    getOutputQueue()->setCapacity(512);
     getOutputQueue()->start();
-    // Link is reported up only when the keys are installed (association and handshake done in start())
-    setLinkStatus((fKeysUp ? kIONetworkLinkActive : 0) | kIONetworkLinkValid, getCurrentMedium(), 1000000);
+    uint64_t bps = fHt40Active ? 150000000ULL : 72200000ULL;
+    setLinkStatus((fKeysUp ? kIONetworkLinkActive : 0) | kIONetworkLinkValid, getCurrentMedium(), bps);
     fNetifEnabled = true;
-    setProperty("netif-enabled", kOSBooleanTrue);
-    setProperty("netif-link-up", fKeysUp ? kOSBooleanTrue : kOSBooleanFalse);
-    startRx();                                            // begin receiving once the interface is up
+    startRx();
     return kIOReturnSuccess;
 }
 
@@ -2105,188 +2175,431 @@ IOReturn RtlWifiDriver::disable(IONetworkInterface *) {
     getOutputQueue()->flush();
     getOutputQueue()->setCapacity(0);
     setLinkStatus(kIONetworkLinkValid, 0);
-    fNetifEnabled = false;
-    setProperty("netif-enabled", kOSBooleanFalse);
     return kIOReturnSuccess;
 }
 
-// Transmit: Ethernet frame -> 802.11 data frame (to DS, protected) with CCMP header, LLC/SNAP and the chip's
-// AES encryption. Runs on the output queue's work loop; one frame at a time.
+void RtlWifiDriver::txBeCompleteStatic(void *owner, void *param, IOReturn status, uint32_t) {
+    static_cast<RtlWifiDriver *>(owner)->txBeComplete(static_cast<unsigned>(reinterpret_cast<uintptr_t>(param)), status);
+}
+
+void RtlWifiDriver::txHiCompleteStatic(void *owner, void *param, IOReturn status, uint32_t) {
+    static_cast<RtlWifiDriver *>(owner)->txHiComplete(static_cast<unsigned>(reinterpret_cast<uintptr_t>(param)), status);
+}
+
+void RtlWifiDriver::txBeComplete(unsigned idx, IOReturn status) {
+    fTxBeRing.releaseSlot(idx);
+    if (status == kIOReturnSuccess) { fNetTxPackets++; if (fNetStats) fNetStats->outputPackets++; fWatchdog.onUsbSuccess(); }
+    else { fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++; }
+    if (IOOutputQueue *q = getOutputQueue()) q->service();
+}
+
+void RtlWifiDriver::txHiComplete(unsigned idx, IOReturn status) {
+    fTxHiRing.releaseSlot(idx);
+    if (status == kIOReturnSuccess) { fNetTxPackets++; if (fNetStats) fNetStats->outputPackets++; fWatchdog.onUsbSuccess(); }
+    else { fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++; }
+    if (IOOutputQueue *q = getOutputQueue()) q->service();
+}
+
+// V28 Zero-Copy Dual-Pipe WMM + ARP/DHCP/DNS Fast-Lane TX + USB 512-byte ZLP Guard!
 UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
     size_t pktlen = 0;
     for (mbuf_t m = packet; m; m = mbuf_next(m)) pktlen += mbuf_len(m);
-    bool drop = !fKeysUp || !fTxFrame || !fHaveAp || pktlen < 14 || pktlen > 1514;
-    IOReturn r = kIOReturnError;
-    if (!drop) {
-        uint8_t eth[14];
-        mbuf_copydata(packet, 0, 14, eth);
-        uint8_t *f = fTxFrame;
-        memset(f, 0, 40);
-        f[0] = 0x08; f[1] = 0x41;                           // data, to DS, protected
-        memcpy(f + 4, fApBssid, 6);                         // addr1 = AP
-        memcpy(f + 10, &fEfuse[0xd7], 6);                   // addr2 = our MAC
-        memcpy(f + 16, eth, 6);                             // addr3 = destination of the Ethernet frame
-        fTxPn++;
-        f[24] = (uint8_t)fTxPn; f[25] = (uint8_t)(fTxPn >> 8); f[26] = 0; f[27] = 0x20;
-        f[28] = (uint8_t)(fTxPn >> 16); f[29] = (uint8_t)(fTxPn >> 24); f[30] = (uint8_t)(fTxPn >> 32); f[31] = (uint8_t)(fTxPn >> 40);
-        f[32] = 0xaa; f[33] = 0xaa; f[34] = 0x03; f[35] = 0x00; f[36] = 0x00; f[37] = 0x00;   // LLC/SNAP
-        f[38] = eth[12]; f[39] = eth[13];                   // EtherType
-        size_t pl = pktlen - 14;
-        mbuf_copydata(packet, 14, pl, f + 40);
-        r = txDataSec(f, (uint16_t)(40 + pl), 0x00, 0, 0, 0x00c00000, (eth[0] & 1) != 0);
-        if (r != kIOReturnSuccess) drop = true;
-    }
-    freePacket(packet);
-    if (drop) {
-        fNetTxErrors++;
-        if (fNetTxErrors <= 20) setProperty("netif-tx-errors", (uint64_t)fNetTxErrors, 32);
+    if (!fKeysUp || !fHaveAp || pktlen < 14 || pktlen > 1514) {
+        freePacket(packet);
+        fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++;
         return kIOReturnOutputDropped;
     }
-    fNetTxPackets++;
-    if (fNetTxPackets <= 20 || (fNetTxPackets % 32) == 0) setProperty("netif-tx-packets", (uint64_t)fNetTxPackets, 32);
+
+    // Peek only 42 bytes on stack (saves 1.5 KB kernel stack & eliminates double copy!)
+    uint8_t hdrPeek[42];
+    size_t peekLen = (pktlen < sizeof(hdrPeek)) ? pktlen : sizeof(hdrPeek);
+    mbuf_copydata(packet, 0, peekLen, hdrPeek);
+
+    auto cls = rtl8188f::classifyEthHeader(hdrPeek, peekLen);
+    bool useHi = cls.highPriorityPipe && (fPipeOut2 != nullptr);
+    int slotIdx = useHi ? fTxHiRing.acquireSlot() : fTxBeRing.acquireSlot();
+    if (slotIdx < 0) return kIOReturnOutputStall;
+
+    RtlTxSlot &slot = useHi ? fTxHiRing.slot(static_cast<uint32_t>(slotIdx))
+                            : fTxBeRing.slot(static_cast<uint32_t>(slotIdx));
+    fTxPn++;
+    uint16_t hlen = rtl8188f::writeQosDataHeader(
+        slot.buf + rtl8188f::kTxDescSize, hdrPeek, fApBssid, &fEfuse[0xd7],
+        fIsEncrypted, fTxPn, cls.tid);
+    size_t payloadLen = pktlen - 14;
+    // Single copy directly from mbuf into pre-mapped DMA buffer!
+    mbuf_copydata(packet, 14, payloadLen, slot.buf + rtl8188f::kTxDescSize + hlen);
+    uint16_t flen = static_cast<uint16_t>(hlen + payloadLen);
+
+    rtl8188f::TxDescParams tp{};
+    tp.frameLen      = flen;
+    tp.secType       = fIsEncrypted ? rtl8188f::kTxDw1SecCcmp : 0u;
+    tp.tid           = cls.tid;
+    tp.isMulticast   = (hdrPeek[0] & 1) != 0;
+    tp.isQosData     = true;
+    tp.allowAmpdu    = !tp.isMulticast && !cls.isControlFastLane;
+    tp.useDriverRate = false;
+    tp.macId         = 0;
+    rtl8188f::buildTxDesc40(slot.buf, tp);
+
+    uint32_t usbLen = rtl8188f::safeUsbBulkOutLen(rtl8188f::kTxDescSize + flen, slot.buf, rtl8188f::kTxBufSize);
+
+    IOUSBHostCompletion c{};
+    c.owner     = this;
+    c.action    = useHi ? &RtlWifiDriver::txHiCompleteStatic : &RtlWifiDriver::txBeCompleteStatic;
+    c.parameter = reinterpret_cast<void *>(static_cast<uintptr_t>(slotIdx));
+
+    IOUSBHostPipe *pipe = useHi ? fPipeOut2 : fPipeOut3;
+    IOReturn r = pipe ? pipe->io(slot.md, usbLen, &c, 0) : kIOReturnNoDevice;
+    freePacket(packet);
+    if (r != kIOReturnSuccess) {
+        if (useHi) fTxHiRing.releaseSlot(static_cast<uint32_t>(slotIdx));
+        else       fTxBeRing.releaseSlot(static_cast<uint32_t>(slotIdx));
+        fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++;
+        return kIOReturnOutputDropped;
+    }
     return kIOReturnOutputSuccess;
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Receive: two asynchronous bulk-IN reads in flight, each parsed for 802.11 data frames from the AP and handed to
-// the network stack as Ethernet frames (pattern from HoRNDIS: allocatePacket, mbuf_copyback, inputPacket).
-// ---------------------------------------------------------------------------------------------------------------
-
-static const uint32_t kRxBufSize = 16384;
-
 void RtlWifiDriver::rxCompleteStatic(void *owner, void *param, IOReturn status, uint32_t bytes) {
-    ((RtlWifiDriver *)owner)->rxComplete((unsigned)(uintptr_t)param, status, bytes);
+    static_cast<RtlWifiDriver *>(owner)->rxComplete(static_cast<unsigned>(reinterpret_cast<uintptr_t>(param)), status, bytes);
 }
 
 void RtlWifiDriver::submitRx(unsigned idx) {
-    IOUSBHostCompletion c;
-    c.owner = this;
-    c.action = &RtlWifiDriver::rxCompleteStatic;
-    c.parameter = (void *)(uintptr_t)idx;
+    IOUSBHostCompletion c{};
+    c.owner     = this;
+    c.action    = &RtlWifiDriver::rxCompleteStatic;
+    c.parameter = reinterpret_cast<void *>(static_cast<uintptr_t>(idx));
     OSIncrementAtomic(&fRxInflight);
-    IOReturn r = fPipeIn ? fPipeIn->io(fRxMd[idx], kRxBufSize, &c, 0) : kIOReturnNoDevice;
-    if (r != kIOReturnSuccess) {
-        OSDecrementAtomic(&fRxInflight);
-        fRxRunning = false;
-        setProperty("rx-stopped-status", (uint64_t)(uint32_t)r, 32);
-    }
+    IOReturn r = fPipeIn ? fPipeIn->io(fRxMd[idx], rtl8188f::kRxBufSize, &c, 0) : kIOReturnNoDevice;
+    if (r != kIOReturnSuccess) { OSDecrementAtomic(&fRxInflight); fRxRunning = false; fUsbErrWindow++; }
 }
 
 void RtlWifiDriver::startRx() {
     if (fRxRunning || !fPipeIn || !fKeysUp) return;
-    for (unsigned i = 0; i < 2; i++) {
-        if (!fRxMd[i]) fRxMd[i] = IOBufferMemoryDescriptor::withOptions(kIODirectionIn, kRxBufSize, 1);
-        if (!fRxMd[i]) { setProperty("rx-start", "no memory"); return; }
+    for (unsigned i = 0; i < rtl8188f::kRxRingSize; i++) {
+        if (!fRxMd[i]) fRxMd[i] = IOBufferMemoryDescriptor::withOptions(kIODirectionIn, rtl8188f::kRxBufSize, 1);
+        if (!fRxMd[i]) return;
     }
-    fRxErrRun = 0;
-    fRxRunning = true;
-    submitRx(0);
-    if (fRxRunning) submitRx(1);
-    setProperty("rx-start", fRxRunning ? "running" : "failed");
+    fRxErrRun = 0; fRxRunning = true;
+    for (unsigned i = 0; i < rtl8188f::kRxRingSize && fRxRunning; i++) submitRx(i);
 }
 
 void RtlWifiDriver::stopRx() {
     fRxRunning = false;
     if (fPipeIn) fPipeIn->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);
-    for (int i = 0; i < 100 && fRxInflight > 0; i++) IOSleep(10);          // wait for the completions to finish
-    setProperty("rx-inflight-at-stop", (uint64_t)(uint32_t)fRxInflight, 32);
+    for (int i = 0; i < 100 && fRxInflight > 0; i++) IOSleep(10);
+    fRxReorder.flushAll([this](mbuf_t m) { if (m) freePacket(m); });
 }
 
 void RtlWifiDriver::rxComplete(unsigned idx, IOReturn status, uint32_t bytes) {
     if (status == kIOReturnSuccess && fRxRunning) {
-        fRxErrRun = 0;
-        handleRx((const uint8_t *)fRxMd[idx]->getBytesNoCopy(), bytes);
-    } else if (status != kIOReturnSuccess) {
-        fRxErrRun++;
-    }
-    bool dead = (status == kIOReturnAborted || status == kIOReturnNoDevice || status == kIOReturnNotResponding || fRxErrRun > 100);
+        fRxErrRun = 0; fWatchdog.onUsbSuccess();
+        handleRx(static_cast<const uint8_t *>(fRxMd[idx]->getBytesNoCopy()), bytes);
+    } else if (status != kIOReturnSuccess) { fRxErrRun++; fUsbErrWindow++; }
+    bool dead = (status == kIOReturnAborted || status == kIOReturnNoDevice ||
+                 status == kIOReturnNotResponding || fRxErrRun > 100);
     if (!fRxRunning || dead) {
-        if (dead && fRxRunning) { fRxRunning = false; setProperty("rx-stopped-status", (uint64_t)(uint32_t)status, 32); }
+        if (dead && fRxRunning) fRxRunning = false;
         OSDecrementAtomic(&fRxInflight);
         return;
     }
     OSDecrementAtomic(&fRxInflight);
-    submitRx(idx);                                                           // keep two reads pending
+    submitRx(idx);
 }
 
 void RtlWifiDriver::handleRx(const uint8_t *buf, uint32_t len) {
-    uint32_t pos = 0;
-    while (pos + 24 <= len) {                                               // several packets can share one transfer
-        uint32_t d0 = (uint32_t)buf[pos] | ((uint32_t)buf[pos + 1] << 8) | ((uint32_t)buf[pos + 2] << 16) | ((uint32_t)buf[pos + 3] << 24);
-        uint32_t pktlen = d0 & 0x3fff;
-        uint32_t drvinfo = ((d0 >> 16) & 0xf) * 8;
-        uint32_t shift = (d0 >> 24) & 3;
-        uint32_t off = pos + 24 + drvinfo + shift;
-        uint32_t next = pos + ((pktlen + drvinfo + shift + 24 + 7) & ~7u);   // packets are 8-byte aligned (as rtl8xxxu)
+    uint32_t pos = 0, queued = 0;
+    while (pos + 24 <= len) {
+        uint32_t d0 = rtl8188f::getLe32(buf + pos);
+        uint32_t d3 = rtl8188f::getLe32(buf + pos + 12);
+        uint32_t pktlen  = d0 & 0x3fffu;
+        uint32_t drvinfo = ((d0 >> 16) & 0xfu) * 8u;
+        uint32_t shift   = (d0 >> 24) & 3u;
+        uint32_t off     = pos + 24u + drvinfo + shift;
+        uint32_t next    = pos + ((pktlen + drvinfo + shift + 24u + 7u) & ~7u);
         if (pktlen == 0 || off + pktlen > len) break;
-        if (!((d0 >> 14) & 1) && !((d0 >> 15) & 1)) rxFrame(buf + off, pktlen, d0);   // skip CRC and ICV errors
+
+        // Decode real hardware PHY RSSI from drvinfo (REG_RX_DRVINFO_SZ=4 -> 32 bytes)
+        if (drvinfo >= 16 && ((d0 >> 26) & 1u) && pos + 24u + drvinfo <= len) {
+            fLastRssiDbm = rtl8188f::extractPhyRssiDbm(buf + pos + 24u, drvinfo, d3 & 0x7Fu);
+        }
+        if (!((d0 >> 14) & 1u) && !((d0 >> 15) & 1u)) {
+            if (rxFrame(buf + off, pktlen, d0)) queued++;
+        }
         pos = next;
     }
+    if (queued > 0 && fNetif) fNetif->flushInputQueue();
 }
 
-// One 802.11 frame (without FCS; the chip leaves IV and MIC/ICV in place on protected frames, see the RCR bits).
-void RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
-    if (n < 24 + 8 || !fNetif || !fNetifEnabled) return;
+bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
+    if (n < 24 || !fNetif || !fNetifEnabled) return false;
     uint8_t fc0 = f[0], fc1 = f[1];
-    if (((fc0 >> 2) & 3) != 2) return;                                      // data frames only
-    if (fc0 & 0x40) return;                                                 // null data / CF frames: no payload
-    if ((fc1 & 3) != 2) return;                                             // from DS only
-    if (memcmp(f + 10, fApBssid, 6) != 0) return;                           // from our AP
-    if (memcmp(f + 16, &fEfuse[0xd7], 6) == 0) return;                      // the AP echoing our own broadcast
-    uint32_t hl = (fc0 & 0x80) ? 26 : 24;                                   // QoS data has two more header bytes
+
+    if (fc0 == 0x80 && memcmp(f + 16, fApBssid, 6) == 0) {
+        fBeaconSeen = true; fWatchdog.onBeaconReceived(); return false;
+    }
+    if (rtl8188f::isDeauthOrDisassoc(fc0) && memcmp(f + 10, fApBssid, 6) == 0) {
+        fKeysUp = false; fDriverState = kRtlStateRecovering;
+        setLinkStatus(kIONetworkLinkValid, 0); return false;
+    }
+
+    if (n < 32 || ((fc0 >> 2) & 3) != 2 || (fc0 & 0x40) || (fc1 & 3) != 2) return false;
+    if (memcmp(f + 10, fApBssid, 6) != 0 || memcmp(f + 16, &fEfuse[0xd7], 6) == 0) return false;
+
+    bool isQos = (fc0 & 0x80) != 0;
+    uint32_t hl = isQos ? 26u : 24u;
+    bool isAmsdu = isQos && ((f[24] & 0x80) != 0);
     bool prot = (fc1 & 0x40) != 0;
-    uint32_t sec = (d0 >> 20) & 7, swdec = (d0 >> 27) & 1;
     uint32_t tail = 0;
     if (prot) {
-        if (sec == 0 || swdec) { fNetRxDropped++; return; }                 // the chip did not decrypt it
+        uint32_t sec = (d0 >> 20) & 7u, swdec = (d0 >> 27) & 1u;
+        if (sec == 0 || swdec) { fNetRxDropped++; if (fNetStats) fNetStats->inputErrors++; return false; }
         bool group = (f[4] & 1) != 0;
-        uint8_t cipher = group ? fGtkCipher : 4;                            // pairwise key is CCMP
-        tail = (cipher == 2) ? 12 : 8;                                      // TKIP: MIC + ICV, CCMP: MIC
+        tail = ((group ? fGtkCipher : 4) == 2) ? 12u : 8u;
+    } else if (fIsEncrypted) {
+        return false; // Reject unencrypted data frames on WPA2 sessions
     }
-    uint32_t p = hl + (prot ? 8 : 0);                                       // skip the IV
-    if (p + 8 + tail > n) return;
-    if (f[p] != 0xaa || f[p + 1] != 0xaa || f[p + 2] != 0x03) return;      // LLC/SNAP only
+
+    uint32_t p = hl + (prot ? 8u : 0u);
+    if (p + tail >= n) return false;
+    uint32_t bodyLen = n - p - tail;
+
+    // A-MSDU De-Aggregation for modern Wi-Fi 5/6/7 routers!
+    if (isAmsdu) {
+        rtl8188f::AmsduSubframe subs[16];
+        uint32_t sc = rtl8188f::splitAmsdu(f + p, bodyLen, subs, 16);
+        bool any = false;
+        for (uint32_t i = 0; i < sc; ++i) {
+            uint32_t pl = subs[i].payloadLen > 1500 ? 1500 : subs[i].payloadLen;
+            uint32_t elen = 14u + pl;
+            mbuf_t m = allocatePacket(elen);
+            if (!m) { fNetRxDropped++; continue; }
+            uint8_t *dst = static_cast<uint8_t *>(mbuf_data(m));
+            memcpy(dst, subs[i].da, 6);
+            memcpy(dst + 6, subs[i].sa, 6);
+            dst[12] = static_cast<uint8_t>(subs[i].etherType >> 8);
+            dst[13] = static_cast<uint8_t>(subs[i].etherType);
+            memcpy(dst + 14, subs[i].payload, pl);
+            mbuf_setlen(m, elen); mbuf_pkthdr_setlen(m, elen);
+            fNetif->inputPacket(m, elen, IONetworkInterface::kInputOptionQueuePacket);
+            fNetRxPackets++; fAmsduSubframes++; if (fNetStats) fNetStats->inputPackets++;
+            any = true;
+        }
+        return any;
+    }
+
+    if (bodyLen < 8 || f[p] != 0xaa || f[p + 1] != 0xaa || f[p + 2] != 0x03) return false;
     uint16_t et = (uint16_t)((f[p + 6] << 8) | f[p + 7]);
-    if (et == 0x888e) return;                                               // EAPOL is not for the stack
-    uint32_t pl = n - p - 8 - tail;
+    if (et == 0x888e) {
+        if (fIsEncrypted) handleGtkRekey(f + p + 8, bodyLen - 8);
+        return false;
+    }
+
+    uint32_t pl = bodyLen - 8u;
     if (pl > 1500) pl = 1500;
-    uint32_t elen = 14 + pl;
+    uint32_t elen = 14u + pl;
     mbuf_t m = allocatePacket(elen);
-    if (!m) { fNetRxDropped++; return; }
-    uint8_t eth[14];
-    memcpy(eth, f + 4, 6);                                                  // DA = addr1
-    memcpy(eth + 6, f + 16, 6);                                             // SA = addr3
-    eth[12] = (uint8_t)(et >> 8); eth[13] = (uint8_t)et;
-    mbuf_copyback(m, 0, 14, eth, MBUF_DONTWAIT);
-    mbuf_copyback(m, 14, pl, f + p + 8, MBUF_DONTWAIT);
-    fNetif->inputPacket(m, elen);
-    fNetRxPackets++;
-    if (fNetRxPackets <= 20 || (fNetRxPackets % 32) == 0) setProperty("netif-rx-packets", (uint64_t)fNetRxPackets, 32);
+    if (!m) { fNetRxDropped++; if (fNetStats) fNetStats->inputErrors++; return false; }
+
+    // Zero-copy direct write into mbuf_data()!
+    uint8_t *dst = static_cast<uint8_t *>(mbuf_data(m));
+    memcpy(dst, f + 4, 6);
+    memcpy(dst + 6, f + 16, 6);
+    dst[12] = static_cast<uint8_t>(et >> 8); dst[13] = static_cast<uint8_t>(et);
+    memcpy(dst + 14, f + p + 8, pl);
+    mbuf_setlen(m, elen); mbuf_pkthdr_setlen(m, elen);
+
+    // 64-slot A-MPDU sequence reorder window for unicast QoS data
+    if (isQos && (f[4] & 1) == 0) {
+        uint16_t seq = static_cast<uint16_t>((f[22] | (f[23] << 8)) >> 4);
+        bool emitted = false;
+        bool kept = fRxReorder.insert(seq, m, [this, &emitted](mbuf_t ready) {
+            fNetif->inputPacket(ready, (UInt32)mbuf_pkthdr_len(ready), IONetworkInterface::kInputOptionQueuePacket);
+            fNetRxPackets++; if (fNetStats) fNetStats->inputPackets++;
+            emitted = true;
+        });
+        if (!kept) freePacket(m);
+        return emitted;
+    }
+
+    fNetif->inputPacket(m, elen, IONetworkInterface::kInputOptionQueuePacket);
+    fNetRxPackets++; if (fNetStats) fNetStats->inputPackets++;
+    return true;
+}
+
+void RtlWifiDriver::onWatchdogTick(IOTimerEventSource *sender) {
+    // Flush any aged out-of-order RX reorder slots
+    if (fRxReorder.storedCount() > 0 && fNetif) {
+        fRxReorder.flushAll([this](mbuf_t ready) {
+            fNetif->inputPacket(ready, (UInt32)mbuf_pkthdr_len(ready), IONetworkInterface::kInputOptionQueuePacket);
+            fNetRxPackets++; if (fNetStats) fNetStats->inputPackets++;
+        });
+        fNetif->flushInputQueue();
+    }
+
+    bool stalled = (fTxBeRing.inflight() >= (int32_t)(rtl8188f::kTxBeRingSize - 2));
+    auto act = fWatchdog.tick(fKeysUp, fBeaconSeen, fUsbErrWindow, stalled);
+    fBeaconSeen = false; fUsbErrWindow = 0;
+
+    if (fKeysUp) {
+        wr8(rtl8188f::kRegOfdm0XaAgc1, fDig.updateFromRssi(fLastRssiDbm));
+    }
+    if (act == rtl8188f::kRecoveryClearPipeStall) {
+        if (fPipeOut3) fPipeOut3->clearStall(false);
+        if (fPipeOut2) fPipeOut2->clearStall(false);
+        if (fPipeIn)   fPipeIn->clearStall(false);
+        fUsbStallRecoveries++;
+    } else if (act == rtl8188f::kRecoverySoftReassoc && fTargetSsidLen > 0) {
+        stopRx(); fKeysUp = false; connectToCurrentTarget();
+    }
+    if (sender) sender->setTimeoutMS(2000);
+}
+
+// ---------- IOUserClient runtime API (serialized via IOCommandGate!) ----------
+
+IOReturn RtlWifiDriver::ucGetStatus(RtlWifiStatus *out) {
+    memset(out, 0, sizeof(*out));
+    out->abiVersion     = RTL_WIFI_ABI_VERSION;
+    out->state          = fDriverState;
+    out->channel        = fApChannel;
+    out->rssiDbm        = fLastRssiDbm;
+    out->linkSpeedMbps  = fKeysUp ? (fHt40Active ? 150u : 72u) : 0u;
+    out->txPackets      = fNetTxPackets;
+    out->txErrors       = fNetTxErrors;
+    out->rxPackets      = fNetRxPackets;
+    out->rxErrors       = fNetRxDropped;
+    memcpy(out->macAddr, &fEfuse[0xd7], 6);
+    memcpy(out->bssid, fApBssid, 6);
+    out->ssidLen        = fTargetSsidLen;
+    out->ht40Active     = fHt40Active ? 1 : 0;
+    out->linkQualityPct = rtl8188f::RtlDigController::rssiToQualityPct(fLastRssiDbm);
+    out->digGain        = fDig.currentGain();
+    memcpy(out->ssid, fTargetSsid, fTargetSsidLen);
+    return kIOReturnSuccess;
+}
+
+IOReturn RtlWifiDriver::ucStartScan() {
+    auto fn = [](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+        auto *d = static_cast<RtlWifiDriver *>(owner);
+        bool wasRunning = d->fRxRunning;
+        if (wasRunning) d->stopRx();
+        d->setBssidFilter(false);
+        d->fDriverState = kRtlStateScanning;
+        d->scanAll();
+        d->fDriverState = d->fKeysUp ? kRtlStateConnected : kRtlStateDisconnected;
+        if (d->fKeysUp) d->setBssidFilter(true);
+        if (wasRunning && d->fKeysUp) d->startRx();
+        return kIOReturnSuccess;
+    };
+    return getCommandGate() ? getCommandGate()->runAction(fn) : fn(this, nullptr, nullptr, nullptr, nullptr);
+}
+
+IOReturn RtlWifiDriver::ucGetScanResults(RtlWifiScanList *out) {
+    memcpy(out, &fScanList, sizeof(*out));
+    return kIOReturnSuccess;
+}
+
+IOReturn RtlWifiDriver::ucConnect(const RtlWifiConnectReq *req) {
+    auto fn = [](OSObject *owner, void *arg0, void *, void *, void *) -> IOReturn {
+        auto *d = static_cast<RtlWifiDriver *>(owner);
+        const auto *r = static_cast<const RtlWifiConnectReq *>(arg0);
+        d->stopRx();
+        d->fKeysUp = false;
+        memset(d->fTargetSsid, 0, sizeof(d->fTargetSsid));
+        d->fTargetSsidLen = r->ssidLen;
+        memcpy(d->fTargetSsid, r->ssid, r->ssidLen);
+        d->fHt40Active  = (r->preferHt40 != 0);
+        d->fIsEncrypted = (r->security == kRtlSecWpa2Psk);
+        if (d->fIsEncrypted && r->passLen >= 8 && r->passLen <= RTL_WIFI_MAX_PASS_LEN) {
+            uint8_t pHash[20];
+            rtlcrypto::Sha1 s; rtlcrypto::sha1_init(s);
+            rtlcrypto::sha1_update(s, reinterpret_cast<const uint8_t *>(r->passphrase), r->passLen);
+            rtlcrypto::sha1_final(s, pHash);
+            if (!d->fPmkCache.lookup(d->fTargetSsid, d->fTargetSsidLen, pHash, d->fPmk)) {
+                char pass[RTL_WIFI_MAX_PASS_LEN + 1];
+                memset(pass, 0, sizeof(pass));
+                memcpy(pass, r->passphrase, r->passLen);
+                rtlcrypto::pbkdf2_pmk(pass, reinterpret_cast<const uint8_t *>(d->fTargetSsid), d->fTargetSsidLen, d->fPmk);
+                rtlcrypto::secure_zero(pass, sizeof(pass));
+                d->fPmkCache.store(d->fTargetSsid, d->fTargetSsidLen, pHash, d->fPmk);
+            }
+            d->fHavePmk = true;
+        } else {
+            d->fHavePmk = false;
+        }
+        return d->connectToCurrentTarget() ? kIOReturnSuccess : kIOReturnNotReady;
+    };
+    return getCommandGate()
+        ? getCommandGate()->runAction(fn, const_cast<RtlWifiConnectReq *>(req))
+        : fn(this, const_cast<RtlWifiConnectReq *>(req), nullptr, nullptr, nullptr);
+}
+
+IOReturn RtlWifiDriver::ucDisconnect() {
+    auto fn = [](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+        auto *d = static_cast<RtlWifiDriver *>(owner);
+        d->stopRx();
+        d->fKeysUp = false; d->fHaveAp = false;
+        d->fDriverState = kRtlStateDisconnected;
+        d->setBssidFilter(false);
+        d->sendH2c(rtl8188f::buildH2cMediaStatus(false, 0));
+        d->setLinkStatus(kIONetworkLinkValid, 0);
+        return kIOReturnSuccess;
+    };
+    return getCommandGate() ? getCommandGate()->runAction(fn) : fn(this, nullptr, nullptr, nullptr, nullptr);
+}
+
+IOReturn RtlWifiDriver::ucGetDiagnostics(RtlWifiDiagnostics *out) {
+    memset(out, 0, sizeof(*out));
+    out->abiVersion         = RTL_WIFI_ABI_VERSION;
+    out->txRingInflightBe   = (uint32_t)fTxBeRing.inflight();
+    out->txRingInflightVo   = (uint32_t)fTxHiRing.inflight();
+    out->rxRingInflight     = (uint32_t)fRxInflight;
+    out->watchdogResets     = fWatchdog.resetCount();
+    out->gtkRekeyCount      = fGtkRekeyCount;
+    out->usbStallRecoveries = fUsbStallRecoveries;
+    out->thermalDelta       = fThermal.lastDelta();
+    out->amsduSubframes     = fAmsduSubframes;
+    out->reorderFlushes     = fRxReorder.flushCount();
+    out->pmkCacheHits       = fPmkCache.hits();
+    out->roamCount          = fRoamCount;
+    return kIOReturnSuccess;
 }
 
 bool RtlWifiDriver::willTerminate(IOService *provider, IOOptionBits options) {
-    setProperty("will-terminate", (uint64_t)options, 32);
     fNetifEnabled = false;
+    fTxBeRing.setStopped(true); fTxHiRing.setStopped(true);
     stopRx();
     return super::willTerminate(provider, options);
 }
 
 bool RtlWifiDriver::didTerminate(IOService *provider, IOOptionBits options, bool *defer) {
-    setProperty("did-terminate", (uint64_t)options, 32);
     return super::didTerminate(provider, options, defer);
 }
 
 void RtlWifiDriver::stop(IOService *provider) {
-    setProperty("stop-called", kOSBooleanTrue);
     fNetifEnabled = false;
+    PMstop();
+    if (fWatchdogTimer) {
+        fWatchdogTimer->cancelTimeout();
+        if (IOWorkLoop *wl = getWorkLoop()) wl->removeEventSource(fWatchdogTimer);
+        fWatchdogTimer->release(); fWatchdogTimer = nullptr;
+    }
+    fTxBeRing.setStopped(true); fTxHiRing.setStopped(true);
+    if (fPipeOut3) fPipeOut3->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);
+    if (fPipeOut2) fPipeOut2->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);
     stopRx();
-    for (int i = 0; i < 2; i++) if (fRxMd[i]) { fRxMd[i]->release(); fRxMd[i] = nullptr; }
-    if (fTxFrame) { IOFree(fTxFrame, 1600); fTxFrame = nullptr; }
-    if (fPipeIn)   { fPipeIn->release();   fPipeIn = nullptr; }
-    if (fPipeOut2) { fPipeOut2->release(); fPipeOut2 = nullptr; }
-    if (fPipeOut3) { fPipeOut3->release(); fPipeOut3 = nullptr; }
-    if (fNetif) { fNetif->release(); fNetif = nullptr; }                  // as HoRNDIS::stop
+    for (uint32_t i = 0; i < rtl8188f::kRxRingSize; i++) {
+        if (fRxMd[i]) { fRxMd[i]->release(); fRxMd[i] = nullptr; }
+    }
+    fTxBeRing.destroy(); fTxHiRing.destroy();
+    fPmkCache.clear();
+    if (fTxFrame)   { IOFree(fTxFrame, 1600); fTxFrame = nullptr; }
+    if (fPipeIn)    { fPipeIn->release();    fPipeIn = nullptr; }
+    if (fPipeOut2)  { fPipeOut2->release();  fPipeOut2 = nullptr; }
+    if (fPipeOut3)  { fPipeOut3->release();  fPipeOut3 = nullptr; }
+    if (fNetif)     { fNetif->release();     fNetif = nullptr; }
     if (fInterface) { fInterface->close(this); fInterface = nullptr; }
-    IOLog("RtlWifi: stopped\n");
+    IOLog("RtlWifi: V28 Ultimate stopped cleanly\n");
     super::stop(provider);
 }
