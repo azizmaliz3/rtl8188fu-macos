@@ -4,6 +4,9 @@
 #include "RtlWifiCrypto.h"
 #include "RtlWifiSecrets.h"
 #include "RtlWifiPhyTables.h"      // generated: PHY, AGC and RF tables
+#ifndef RTL_TEST_SSID                 // may be defined in RtlWifiSecrets.h; the default is the original test router
+#define RTL_TEST_SSID "TT_4FF8"
+#endif
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
@@ -1050,7 +1053,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
             if (fc0 == 0x80) {                         // beacon
                 beacons++;
                 if (!fHaveAp) {                        // test shortcut: look for the user's own router
-                    static const char kTestSsid[] = "TT_4FF8";
+                    static const char kTestSsid[] = RTL_TEST_SSID;
                     uint32_t ie2 = off + 24 + 12;
                     if (ie2 + 2 <= got && buf[ie2] == 0 && buf[ie2 + 1] == sizeof(kTestSsid) - 1 &&
                         ie2 + 2 + buf[ie2 + 1] <= got && memcmp(buf + ie2 + 2, kTestSsid, buf[ie2 + 1]) == 0) {
@@ -1357,7 +1360,7 @@ static int findIe(const uint8_t *ies, uint16_t len, uint8_t tag, const uint8_t *
 // AP's basic rate set is satisfied by construction. The RSN IE selects CCMP + PSK with the AP's group cipher.
 IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     if (!fHaveAp) return kIOReturnBadArgument;
-    static const char kTestSsid[] = "TT_4FF8";
+    static const char kTestSsid[] = RTL_TEST_SSID;
     const uint8_t ssidLen = sizeof(kTestSsid) - 1;
     uint8_t f[200];
     memset(f, 0, sizeof(f));
@@ -1871,7 +1874,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v24");
+    setProperty("build-tag", "v24b");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -1961,12 +1964,13 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
             setProperty("set-channel-status", (uint64_t)(uint32_t)r, 32);
             if (r == kIOReturnSuccess) {
                 setStationMode();
-                static const uint8_t kProbeCh[] = {1, 6, 11};          // find the router's beacon
+                static const uint8_t kProbeCh[] = {1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10};   // find the test network's beacon; stop when found
                 for (unsigned k = 0; k < sizeof(kProbeCh); k++) {
                     uint8_t ch = kProbeCh[k];
                     if (setChannel20(ch) != kIOReturnSuccess) continue;
                     for (int t = 0; t < 3; t++) { txProbeRequest(ch, 0x00, 'a'); IOSleep(10); }
                     rxProbe(ch, 'a');
+                    if (fHaveAp) break;
                 }
                 setProperty("ap-found", fHaveAp ? kOSBooleanTrue : kOSBooleanFalse);
                 if (fHaveAp) {
@@ -1977,7 +1981,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
                     setProperty("ap-channel", (uint64_t)fApChannel, 8);
                     selfTest();
                     if (strcmp(RTL_TEST_PASSPHRASE, "CHANGE_ME") != 0 && strlen(RTL_TEST_PASSPHRASE) >= 8) {
-                        rtlcrypto::pbkdf2_pmk(RTL_TEST_PASSPHRASE, (const uint8_t *)"TT_4FF8", 7, fPmk);
+                        rtlcrypto::pbkdf2_pmk(RTL_TEST_PASSPHRASE, (const uint8_t *)RTL_TEST_SSID, sizeof(RTL_TEST_SSID) - 1, fPmk);
                         fHavePmk = true;
                     }
                     setProperty("passphrase-set", fHavePmk ? kOSBooleanTrue : kOSBooleanFalse);
