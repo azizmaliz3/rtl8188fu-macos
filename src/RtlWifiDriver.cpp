@@ -2088,7 +2088,7 @@ bool RtlWifiDriver::start(IOService *provider) {
     if (!attachInterface((IONetworkInterface **)&fNetif, true)) return true;
     if (fNetif) {
         IONetworkData *nd = fNetif->getNetworkData(kIONetworkStatsKey);
-        if (nd) fNetStats = static_cast<IONetworkStats *>(nd->getBuffer());
+        if (nd) fNetStats = static_cast<IONetworkStats *>(const_cast<void *>(nd->getBuffer()));
     }
     setLinkStatus(kIONetworkLinkValid);
 
