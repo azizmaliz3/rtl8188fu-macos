@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleExecutable</key><string>RtlWifiDriver</string>
+	<key>CFBundleIdentifier</key><string>io.github.azizmaliz3.RtlWifiDriver</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>RtlWifiDriver</string>
+	<key>CFBundlePackageType</key><string>KEXT</string>
+	<key>CFBundleShortVersionString</key><string>0.4.0</string>
+	<key>CFBundleVersion</key><string>0.4.0</string>
+	<key>LSMinimumSystemVersion</key><string>10.15</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RtlWifi_0bda_f179</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>io.github.azizmaliz3.RtlWifiDriver</string>
+			<key>IOClass</key><string>RtlWifiDriver</string>
+			<key>IOMatchCategory</key><string>RtlWifiDriver</string>
+			<key>IOProviderClass</key><string>IOUSBHostInterface</string>
+			<key>IOUserClientClass</key><string>RtlWifiUserClient</string>
+			<key>IOProbeScore</key><integer>4000</integer>
+			<key>bConfigurationValue</key><integer>1</integer>
+			<key>bInterfaceNumber</key><integer>0</integer>
+			<key>idProduct</key><integer>61817</integer>
+			<key>idVendor</key><integer>3034</integer>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IONetworkingFamily</key><string>1.5.0</string>
+		<key>com.apple.iokit.IOUSBHostFamily</key><string>1.0.1</string>
+		<key>com.apple.kpi.bsd</key><string>8.0</string>
+		<key>com.apple.kpi.iokit</key><string>8.0</string>
+		<key>com.apple.kpi.libkern</key><string>8.0</string>
+		<key>com.apple.kpi.mach</key><string>8.0</string>
+	</dict>
+</dict>
+</plist>
