@@ -771,12 +771,12 @@ IOReturn RtlWifiDriver::initCalib() {
     W(0x0228, 1, 6 << 1);                              // REG_DWBCN1_CTRL_8723B
     // V27: Enable USB RXDMA aggregation (8 pages / timeout 4) for multi-packet bulk-IN bursts
     uint8_t aggCtrl = rd8(REG_TRXDMA_CTRL);
-    aggCtrl |= BIT(2);                                 // TRXDMA_CTRL_RXDMA_AGG_EN
+    aggCtrl &= ~BIT(2);                                 // TRXDMA_CTRL_RXDMA_AGG_EN
     uint32_t aggRx = rd32(0x0280);                     // REG_RXDMA_AGG_PG_TH
     aggRx &= ~BIT(31);
-    aggRx = (aggRx & ~0xFF0Fu) | 0x0408u;
+    aggRx &= ~0xFF0Fu;
     uint8_t rxdmaMode = rd8(0x0290);
-    rxdmaMode |= BIT(1);
+    rxdmaMode &= ~BIT(1);
     W(REG_TRXDMA_CTRL, 1, aggCtrl);
     W(0x0280, 4, aggRx);
     W(0x0290, 1, rxdmaMode);
@@ -1890,7 +1890,7 @@ void RtlWifiDriver::sendH2c(const rtl8188f::H2cCommand &cmd) {
         if ((rd8(rtl8188f::kRegHmetfr) & (1u << fH2cBox)) == 0) break;
         IODelay(100);
     }
-    wr16(static_cast<uint16_t>(rtl8188f::kRegHmeboxExt0 + 2u * fH2cBox), cmd.ext);
+    wr32(static_cast<uint16_t>(rtl8188f::kRegHmeboxExt0 + 4u * fH2cBox), 0x000FFFFFu);
     wr32(static_cast<uint16_t>(rtl8188f::kRegHmebox0 + 4u * fH2cBox), cmd.cmd);
     fH2cBox = (fH2cBox + 1u) & 3u;
 }
@@ -2015,7 +2015,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fPmkCache.clear(); fRxReorder.reset(0);
 
     if (!super::start(provider)) return false;
-    setProperty("build-tag", "v28.1-routerfix");
+    setProperty("build-tag", "v28.2-rocksolid");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
 
@@ -2205,7 +2205,7 @@ UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
     mbuf_copydata(packet, 0, peekLen, hdrPeek);
 
     auto cls = rtl8188f::classifyEthHeader(hdrPeek, peekLen);
-    bool useHi = cls.highPriorityPipe && (fPipeOut2 != nullptr);
+    bool useHi = false;
     int slotIdx = useHi ? fTxHiRing.acquireSlot() : fTxBeRing.acquireSlot();
     if (slotIdx < 0) return kIOReturnOutputStall;
 
@@ -2223,11 +2223,11 @@ UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
     rtl8188f::TxDescParams tp{};
     tp.frameLen      = flen;
     tp.secType       = fIsEncrypted ? rtl8188f::kTxDw1SecCcmp : 0u;
-    tp.tid           = cls.tid;
+    tp.tid           = 0;
     tp.isMulticast   = (hdrPeek[0] & 1) != 0;
     tp.isQosData     = true;
-    tp.allowAmpdu    = !tp.isMulticast && !cls.isControlFastLane;
-    tp.useDriverRate = false;
+    tp.allowAmpdu    = false;
+    tp.useDriverRate = true; tp.driverRate = (tp.isMulticast || cls.isControlFastLane) ? 0x04 : 0x0B;
     tp.macId         = 0;
     rtl8188f::buildTxDesc40(slot.buf, tp);
 
@@ -2270,7 +2270,7 @@ void RtlWifiDriver::startRx() {
         if (!fRxMd[i]) fRxMd[i] = IOBufferMemoryDescriptor::withOptions(kIODirectionIn, rtl8188f::kRxBufSize, 1);
         if (!fRxMd[i]) return;
     }
-    fRxErrRun = 0; fRxRunning = true;
+    fRxErrRun = 0; fRxRunning = true; wr8(REG_TRXDMA_CTRL, rd8(REG_TRXDMA_CTRL) | BIT(2)); wr32(0x0280, (rd32(0x0280) & ~0xFF0Fu) | 0x0408u); wr8(0x0290, rd8(0x0290) | BIT(1));
     for (unsigned i = 0; i < rtl8188f::kRxRingSize && fRxRunning; i++) submitRx(i);
 }
 
@@ -2278,7 +2278,7 @@ void RtlWifiDriver::stopRx() {
     fRxRunning = false;
     if (fPipeIn) fPipeIn->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);
     for (int i = 0; i < 100 && fRxInflight > 0; i++) IOSleep(10);
-    fRxReorder.flushAll([this](mbuf_t m) { if (m) freePacket(m); });
+    fRxReorder.flushAll([this](mbuf_t m) { if (m) freePacket(m); }); wr8(REG_TRXDMA_CTRL, rd8(REG_TRXDMA_CTRL) & ~BIT(2));
 }
 
 void RtlWifiDriver::rxComplete(unsigned idx, IOReturn status, uint32_t bytes) {
@@ -2400,7 +2400,7 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
     mbuf_setlen(m, elen); mbuf_pkthdr_setlen(m, elen);
 
     // 64-slot A-MPDU sequence reorder window for unicast QoS data
-    if (isQos && (f[4] & 1) == 0) {
+    if (false && isQos && (f[4] & 1) == 0) {
         uint16_t seq = static_cast<uint16_t>((f[22] | (f[23] << 8)) >> 4);
         bool emitted = false;
         bool kept = fRxReorder.insert(seq, m, [this, &emitted](mbuf_t ready) {
