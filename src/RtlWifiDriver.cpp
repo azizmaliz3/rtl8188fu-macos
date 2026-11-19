@@ -10,6 +10,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
+#include <libkern/OSAtomic.h>
 
 #define super IOEthernetController
 
@@ -1417,16 +1418,19 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
 }
 
 // Send one data frame through the best-effort queue (bulk-OUT 0x03). Same descriptor layout as txMgmt,
-// but queue 0 (BE), first/last segment and a unicast destination.
+// but queue 0 (BE), first/last segment.
 // secType: 0 = clear, 0x00c00000 = AES/CCMP, 0x00400000 = RC4/TKIP (txdw1 bits 22..23, from rtl8xxxu.h).
-// With a protected frame the chip adds IV and MIC itself (Linux sets IEEE80211_KEY_FLAG_GENERATE_IV): the
-// frame passed in has the Protected bit set in its frame control and no IV.
+// For a protected frame the CALLER builds the 8-byte CCMP header (IV) behind the 802.11 header: mac80211 does
+// that in software for keys with IEEE80211_KEY_FLAG_GENERATE_IV (set by rtl8xxxu); the chip only encrypts the
+// payload and appends the MIC. tag = 0: no ioreg properties (used for every packet of the data path).
 IOReturn RtlWifiDriver::txDataSec(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag, uint32_t secType, bool bmc) {
-    if (!fPipeOut3 || len > 400) return kIOReturnBadArgument;
-    uint8_t pkt[448];
-    memset(pkt, 0, sizeof(pkt));
-    uint8_t *d = pkt;
-    memcpy(pkt + 40, frame, len);
+    if (!fPipeOut3 || len > 1600) return kIOReturnBadArgument;
+    uint32_t total = 40 + len;
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionOut, total, 1);
+    if (!md) return kIOReturnNoMemory;
+    uint8_t *d = (uint8_t *)md->getBytesNoCopy();
+    memset(d, 0, 40);
+    memcpy(d + 40, frame, len);
     d[0] = len & 0xff; d[1] = len >> 8;             // pkt_size
     d[2] = 40;                                      // pkt_offset = descriptor size
     d[3] = 0x80 | 0x08 | 0x04;                      // OWN | FIRST | LAST
@@ -1441,16 +1445,14 @@ IOReturn RtlWifiDriver::txDataSec(const uint8_t *frame, uint16_t len, uint8_t ra
     for (int i = 0; i < 16; i++) csum ^= (uint16_t)(d[2 * i] | (d[2 * i + 1] << 8));
     d[28] = csum & 0xff; d[29] = csum >> 8;
 
-    uint32_t total = 40 + len;
-    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionOut, total, 1);
-    if (!md) return kIOReturnNoMemory;
-    memcpy(md->getBytesNoCopy(), pkt, total);
     uint32_t got = 0;
     IOReturn r = fPipeOut3->io(md, total, got, 500);
     md->release();
-    char key[48];
-    snprintf(key, sizeof(key), "tx-ch%d%c-status", channel, tag); setProperty(key, (uint64_t)(uint32_t)r, 32);
-    snprintf(key, sizeof(key), "tx-ch%d%c-bytes", channel, tag);  setProperty(key, (uint64_t)got, 32);
+    if (tag) {
+        char key[48];
+        snprintf(key, sizeof(key), "tx-ch%d%c-status", channel, tag); setProperty(key, (uint64_t)(uint32_t)r, 32);
+        snprintf(key, sizeof(key), "tx-ch%d%c-bytes", channel, tag);  setProperty(key, (uint64_t)got, 32);
+    }
     return r;
 }
 
@@ -1689,6 +1691,7 @@ void RtlWifiDriver::camWrite(uint8_t idx, uint8_t cipher, uint8_t keyId, bool gr
 // rtl8xxxu_set_key for the pairwise CCMP key (entry 0) and the group key (entry 1), then enable security
 void RtlWifiDriver::installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t *gtk16, uint8_t channel) {
     (void)channel;
+    fGtkCipher = gtkCipher;
     fTxPn = 0;                                                              // CCMP packet number: first frame uses 1, like mac80211
     uint16_t cr = rd16(REG_CR);
     cr |= BIT(9);                                                           // CR_SECURITY_ENABLE
@@ -1875,12 +1878,19 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fNetif = nullptr;
     fNetifEnabled = fKeysUp = false;
     fNetTxDropped = 0;
+    fRxMd[0] = fRxMd[1] = nullptr;
+    fRxInflight = 0;
+    fRxRunning = false;
+    fRxErrRun = 0;
+    fTxFrame = nullptr;
+    fGtkCipher = 0;
+    fNetTxPackets = fNetTxErrors = fNetRxPackets = fNetRxDropped = 0;
     fApChannel = 0;
     fApIeLen = 0;
     fApCap = 0;
     if (!super::start(provider)) return false;
     setProperty("start-called", kOSBooleanTrue);
-    setProperty("build-tag", "v24c");
+    setProperty("build-tag", "v25");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface) { IOLog("RtlWifi: provider is not IOUSBHostInterface\n"); return false; }
     if (!fInterface->open(this)) { IOLog("RtlWifi: open failed\n"); fInterface = nullptr; return false; }
@@ -2017,6 +2027,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
 
 bool RtlWifiDriver::start(IOService *provider) {
     if (!startHardware(provider)) return false;          // radio bring-up, association, handshake and DHCP test as before
+    fTxFrame = (uint8_t *)IOMalloc(1600);                // frame buffer for outputPacket()
 
     OSObject *providerClass = provider->getProperty("IOClassNameOverride");   // keeps the network daemon from creating new
     if (providerClass) setProperty("IOProviderClass", providerClass);        // interface names on every start (as HoRNDIS)
@@ -2082,11 +2093,14 @@ IOReturn RtlWifiDriver::enable(IONetworkInterface *) {
     fNetifEnabled = true;
     setProperty("netif-enabled", kOSBooleanTrue);
     setProperty("netif-link-up", fKeysUp ? kOSBooleanTrue : kOSBooleanFalse);
+    startRx();                                            // begin receiving once the interface is up
     return kIOReturnSuccess;
 }
 
 IOReturn RtlWifiDriver::disable(IONetworkInterface *) {
     if (!fNetifEnabled) return kIOReturnSuccess;
+    fNetifEnabled = false;
+    stopRx();
     getOutputQueue()->stop();
     getOutputQueue()->flush();
     getOutputQueue()->setCapacity(0);
@@ -2096,16 +2110,164 @@ IOReturn RtlWifiDriver::disable(IONetworkInterface *) {
     return kIOReturnSuccess;
 }
 
-// Transmit is not implemented yet: free the packet and count it.
+// Transmit: Ethernet frame -> 802.11 data frame (to DS, protected) with CCMP header, LLC/SNAP and the chip's
+// AES encryption. Runs on the output queue's work loop; one frame at a time.
 UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
+    size_t pktlen = 0;
+    for (mbuf_t m = packet; m; m = mbuf_next(m)) pktlen += mbuf_len(m);
+    bool drop = !fKeysUp || !fTxFrame || !fHaveAp || pktlen < 14 || pktlen > 1514;
+    IOReturn r = kIOReturnError;
+    if (!drop) {
+        uint8_t eth[14];
+        mbuf_copydata(packet, 0, 14, eth);
+        uint8_t *f = fTxFrame;
+        memset(f, 0, 40);
+        f[0] = 0x08; f[1] = 0x41;                           // data, to DS, protected
+        memcpy(f + 4, fApBssid, 6);                         // addr1 = AP
+        memcpy(f + 10, &fEfuse[0xd7], 6);                   // addr2 = our MAC
+        memcpy(f + 16, eth, 6);                             // addr3 = destination of the Ethernet frame
+        fTxPn++;
+        f[24] = (uint8_t)fTxPn; f[25] = (uint8_t)(fTxPn >> 8); f[26] = 0; f[27] = 0x20;
+        f[28] = (uint8_t)(fTxPn >> 16); f[29] = (uint8_t)(fTxPn >> 24); f[30] = (uint8_t)(fTxPn >> 32); f[31] = (uint8_t)(fTxPn >> 40);
+        f[32] = 0xaa; f[33] = 0xaa; f[34] = 0x03; f[35] = 0x00; f[36] = 0x00; f[37] = 0x00;   // LLC/SNAP
+        f[38] = eth[12]; f[39] = eth[13];                   // EtherType
+        size_t pl = pktlen - 14;
+        mbuf_copydata(packet, 14, pl, f + 40);
+        r = txDataSec(f, (uint16_t)(40 + pl), 0x00, 0, 0, 0x00c00000, (eth[0] & 1) != 0);
+        if (r != kIOReturnSuccess) drop = true;
+    }
     freePacket(packet);
-    fNetTxDropped++;
-    if (fNetTxDropped <= 50) setProperty("netif-tx-dropped", (uint64_t)fNetTxDropped, 32);
-    return kIOReturnOutputDropped;
+    if (drop) {
+        fNetTxErrors++;
+        if (fNetTxErrors <= 20) setProperty("netif-tx-errors", (uint64_t)fNetTxErrors, 32);
+        return kIOReturnOutputDropped;
+    }
+    fNetTxPackets++;
+    if (fNetTxPackets <= 20 || (fNetTxPackets % 32) == 0) setProperty("netif-tx-packets", (uint64_t)fNetTxPackets, 32);
+    return kIOReturnOutputSuccess;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Receive: two asynchronous bulk-IN reads in flight, each parsed for 802.11 data frames from the AP and handed to
+// the network stack as Ethernet frames (pattern from HoRNDIS: allocatePacket, mbuf_copyback, inputPacket).
+// ---------------------------------------------------------------------------------------------------------------
+
+static const uint32_t kRxBufSize = 16384;
+
+void RtlWifiDriver::rxCompleteStatic(void *owner, void *param, IOReturn status, uint32_t bytes) {
+    ((RtlWifiDriver *)owner)->rxComplete((unsigned)(uintptr_t)param, status, bytes);
+}
+
+void RtlWifiDriver::submitRx(unsigned idx) {
+    IOUSBHostCompletion c;
+    c.owner = this;
+    c.action = &RtlWifiDriver::rxCompleteStatic;
+    c.parameter = (void *)(uintptr_t)idx;
+    OSIncrementAtomic(&fRxInflight);
+    IOReturn r = fPipeIn ? fPipeIn->io(fRxMd[idx], kRxBufSize, &c, 0) : kIOReturnNoDevice;
+    if (r != kIOReturnSuccess) {
+        OSDecrementAtomic(&fRxInflight);
+        fRxRunning = false;
+        setProperty("rx-stopped-status", (uint64_t)(uint32_t)r, 32);
+    }
+}
+
+void RtlWifiDriver::startRx() {
+    if (fRxRunning || !fPipeIn || !fKeysUp) return;
+    for (unsigned i = 0; i < 2; i++) {
+        if (!fRxMd[i]) fRxMd[i] = IOBufferMemoryDescriptor::withOptions(kIODirectionIn, kRxBufSize, 1);
+        if (!fRxMd[i]) { setProperty("rx-start", "no memory"); return; }
+    }
+    fRxErrRun = 0;
+    fRxRunning = true;
+    submitRx(0);
+    if (fRxRunning) submitRx(1);
+    setProperty("rx-start", fRxRunning ? "running" : "failed");
+}
+
+void RtlWifiDriver::stopRx() {
+    fRxRunning = false;
+    if (fPipeIn) fPipeIn->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, this);
+    for (int i = 0; i < 100 && fRxInflight > 0; i++) IOSleep(10);          // wait for the completions to finish
+    setProperty("rx-inflight-at-stop", (uint64_t)(uint32_t)fRxInflight, 32);
+}
+
+void RtlWifiDriver::rxComplete(unsigned idx, IOReturn status, uint32_t bytes) {
+    if (status == kIOReturnSuccess && fRxRunning) {
+        fRxErrRun = 0;
+        handleRx((const uint8_t *)fRxMd[idx]->getBytesNoCopy(), bytes);
+    } else if (status != kIOReturnSuccess) {
+        fRxErrRun++;
+    }
+    bool dead = (status == kIOReturnAborted || status == kIOReturnNoDevice || status == kIOReturnNotResponding || fRxErrRun > 100);
+    if (!fRxRunning || dead) {
+        if (dead && fRxRunning) { fRxRunning = false; setProperty("rx-stopped-status", (uint64_t)(uint32_t)status, 32); }
+        OSDecrementAtomic(&fRxInflight);
+        return;
+    }
+    OSDecrementAtomic(&fRxInflight);
+    submitRx(idx);                                                           // keep two reads pending
+}
+
+void RtlWifiDriver::handleRx(const uint8_t *buf, uint32_t len) {
+    uint32_t pos = 0;
+    while (pos + 24 <= len) {                                               // several packets can share one transfer
+        uint32_t d0 = (uint32_t)buf[pos] | ((uint32_t)buf[pos + 1] << 8) | ((uint32_t)buf[pos + 2] << 16) | ((uint32_t)buf[pos + 3] << 24);
+        uint32_t pktlen = d0 & 0x3fff;
+        uint32_t drvinfo = ((d0 >> 16) & 0xf) * 8;
+        uint32_t shift = (d0 >> 24) & 3;
+        uint32_t off = pos + 24 + drvinfo + shift;
+        uint32_t next = pos + ((pktlen + drvinfo + shift + 24 + 7) & ~7u);   // packets are 8-byte aligned (as rtl8xxxu)
+        if (pktlen == 0 || off + pktlen > len) break;
+        if (!((d0 >> 14) & 1) && !((d0 >> 15) & 1)) rxFrame(buf + off, pktlen, d0);   // skip CRC and ICV errors
+        pos = next;
+    }
+}
+
+// One 802.11 frame (without FCS; the chip leaves IV and MIC/ICV in place on protected frames, see the RCR bits).
+void RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
+    if (n < 24 + 8 || !fNetif || !fNetifEnabled) return;
+    uint8_t fc0 = f[0], fc1 = f[1];
+    if (((fc0 >> 2) & 3) != 2) return;                                      // data frames only
+    if (fc0 & 0x40) return;                                                 // null data / CF frames: no payload
+    if ((fc1 & 3) != 2) return;                                             // from DS only
+    if (memcmp(f + 10, fApBssid, 6) != 0) return;                           // from our AP
+    if (memcmp(f + 16, &fEfuse[0xd7], 6) == 0) return;                      // the AP echoing our own broadcast
+    uint32_t hl = (fc0 & 0x80) ? 26 : 24;                                   // QoS data has two more header bytes
+    bool prot = (fc1 & 0x40) != 0;
+    uint32_t sec = (d0 >> 20) & 7, swdec = (d0 >> 27) & 1;
+    uint32_t tail = 0;
+    if (prot) {
+        if (sec == 0 || swdec) { fNetRxDropped++; return; }                 // the chip did not decrypt it
+        bool group = (f[4] & 1) != 0;
+        uint8_t cipher = group ? fGtkCipher : 4;                            // pairwise key is CCMP
+        tail = (cipher == 2) ? 12 : 8;                                      // TKIP: MIC + ICV, CCMP: MIC
+    }
+    uint32_t p = hl + (prot ? 8 : 0);                                       // skip the IV
+    if (p + 8 + tail > n) return;
+    if (f[p] != 0xaa || f[p + 1] != 0xaa || f[p + 2] != 0x03) return;      // LLC/SNAP only
+    uint16_t et = (uint16_t)((f[p + 6] << 8) | f[p + 7]);
+    if (et == 0x888e) return;                                               // EAPOL is not for the stack
+    uint32_t pl = n - p - 8 - tail;
+    if (pl > 1500) pl = 1500;
+    uint32_t elen = 14 + pl;
+    mbuf_t m = allocatePacket(elen);
+    if (!m) { fNetRxDropped++; return; }
+    uint8_t eth[14];
+    memcpy(eth, f + 4, 6);                                                  // DA = addr1
+    memcpy(eth + 6, f + 16, 6);                                             // SA = addr3
+    eth[12] = (uint8_t)(et >> 8); eth[13] = (uint8_t)et;
+    mbuf_copyback(m, 0, 14, eth, MBUF_DONTWAIT);
+    mbuf_copyback(m, 14, pl, f + p + 8, MBUF_DONTWAIT);
+    fNetif->inputPacket(m, elen);
+    fNetRxPackets++;
+    if (fNetRxPackets <= 20 || (fNetRxPackets % 32) == 0) setProperty("netif-rx-packets", (uint64_t)fNetRxPackets, 32);
 }
 
 bool RtlWifiDriver::willTerminate(IOService *provider, IOOptionBits options) {
     setProperty("will-terminate", (uint64_t)options, 32);
+    fNetifEnabled = false;
+    stopRx();
     return super::willTerminate(provider, options);
 }
 
@@ -2116,6 +2278,10 @@ bool RtlWifiDriver::didTerminate(IOService *provider, IOOptionBits options, bool
 
 void RtlWifiDriver::stop(IOService *provider) {
     setProperty("stop-called", kOSBooleanTrue);
+    fNetifEnabled = false;
+    stopRx();
+    for (int i = 0; i < 2; i++) if (fRxMd[i]) { fRxMd[i]->release(); fRxMd[i] = nullptr; }
+    if (fTxFrame) { IOFree(fTxFrame, 1600); fTxFrame = nullptr; }
     if (fPipeIn)   { fPipeIn->release();   fPipeIn = nullptr; }
     if (fPipeOut2) { fPipeOut2->release(); fPipeOut2 = nullptr; }
     if (fPipeOut3) { fPipeOut3->release(); fPipeOut3 = nullptr; }

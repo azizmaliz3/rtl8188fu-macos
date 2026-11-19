@@ -11,6 +11,8 @@
 struct RtlReg32Val;
 struct RtlRfRegVal;
 
+class IOBufferMemoryDescriptor;
+
 class RtlWifiDriver : public IOEthernetController {
     OSDeclareDefaultStructors(RtlWifiDriver)
     IOUSBHostInterface *fInterface;
@@ -75,6 +77,21 @@ class RtlWifiDriver : public IOEthernetController {
     IOEthernetInterface *fNetif;
     bool     fNetifEnabled, fKeysUp;
     uint32_t fNetTxDropped;
+    // Data path (v25): asynchronous receive on bulk-IN, transmit from outputPacket()
+    IOBufferMemoryDescriptor *fRxMd[2];
+    volatile int32_t fRxInflight;
+    volatile bool    fRxRunning;
+    uint32_t fRxErrRun;
+    uint8_t  *fTxFrame;
+    uint8_t  fGtkCipher;
+    uint32_t fNetTxPackets, fNetTxErrors, fNetRxPackets, fNetRxDropped;
+    void     startRx();
+    void     stopRx();
+    void     submitRx(unsigned idx);
+    void     rxComplete(unsigned idx, IOReturn status, uint32_t bytes);
+    void     handleRx(const uint8_t *buf, uint32_t len);
+    void     rxFrame(const uint8_t *f, uint32_t len, uint32_t desc0);
+    static void rxCompleteStatic(void *owner, void *param, IOReturn status, uint32_t bytes);
     IOReturn txEapolMsg2(uint8_t channel, char tag);
     void     runHandshake(uint8_t channel);
     IOReturn txEapolMsg4(uint8_t channel, char tag);
