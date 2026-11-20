@@ -154,7 +154,7 @@ volatile bool fHavePendingGtk;
     bool     fHavePmk, fHavePtk, fHaveMsg1, fStopOnMsg1, fStopOnMsg3, fNewMsg1;
     uint8_t  fApBssid[6];
     bool     fHaveAp;
-    uint8_t  fApIes[256];
+    uint8_t  fApIes[640];
     uint16_t fApIeLen;
     uint16_t fApCap;
     uint8_t  fApChannel;
