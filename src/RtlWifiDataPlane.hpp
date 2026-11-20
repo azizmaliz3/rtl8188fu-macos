@@ -179,7 +179,7 @@ static inline void buildTxDesc40(uint8_t *d, const TxDescParams &p) {
 
     uint32_t dw3 = p.useDriverRate ? kTxDw3UseRate : 0u;
     uint32_t dw4 = p.useDriverRate
-        ? (static_cast<uint32_t>(p.driverRate) | (6u << 18) | kTxDw4RetryLimitEn)
+        ? (static_cast<uint32_t>(p.driverRate) | (12u << 18) | kTxDw4RetryLimitEn)
         : 0u;
     putLe32(d + 12, dw3);
     putLe32(d + 16, dw4);
