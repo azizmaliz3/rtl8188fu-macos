@@ -1785,7 +1785,7 @@ void RtlWifiDriver::setCrystalCap(uint8_t cap) {
 
 // Active scan of channels 1..13: two broadcast probe requests per channel, then collect beacons and
 // probe responses (synchronous bulk-IN reads). Unique BSSIDs are published as scan-NN properties.
-struct RtlScanEntry { uint8_t bssid[6]; char ssid[33]; uint8_t ch; uint8_t sec; };
+struct RtlScanEntry { uint8_t bssid[6]; char ssid[33]; uint8_t ch; uint8_t sec; int8_t rssiDbm; };
 
 void RtlWifiDriver::scanAll() {
     if (!fPipeIn) return;
