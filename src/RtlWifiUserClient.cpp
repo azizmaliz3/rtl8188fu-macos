@@ -24,11 +24,13 @@ bool RtlWifiUserClient::initWithTask(task_t owningTask, void *securityToken, UIn
 bool RtlWifiUserClient::start(IOService *provider) {
     if (!super::start(provider)) return false;
     fDriver = OSDynamicCast(RtlWifiDriver, provider);
-    return fDriver != nullptr;
+    if (!fDriver) return false;
+    fDriver->retain();
+    return true;
 }
 
 void RtlWifiUserClient::stop(IOService *provider) {
-    fDriver = nullptr;
+    if (fDriver) { fDriver->release(); fDriver = nullptr; }
     super::stop(provider);
 }
 
@@ -42,6 +44,7 @@ IOReturn RtlWifiUserClient::externalMethod(uint32_t selector,
                                            IOExternalMethodDispatch *dispatch,
                                            OSObject *target,
                                            void *reference) {
+    if (isInactive() || !fDriver) return kIOReturnNotAttached;
     if (selector >= kRtlMethodCount) return kIOReturnUnsupported;
     dispatch = const_cast<IOExternalMethodDispatch *>(&sMethods[selector]);
     target   = this;
