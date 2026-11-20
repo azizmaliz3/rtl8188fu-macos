@@ -1423,7 +1423,7 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     f[n++] = rsnCaps[0]; f[n++] = rsnCaps[1];
     memcpy(fOwnRsn, f + rsnStart, 22);
     }
-    
+        fApIsHt = (findIe(fApIes, fApIeLen, 45, &p) == 26);
     // 1x1 20MHz HT capabilities:           // HT capabilities, mirrored
     memcpy(f + n, rtl8188f::kRtl8188fHtCapIe, sizeof(rtl8188f::kRtl8188fHtCapIe)); n += sizeof(rtl8188f::kRtl8188fHtCapIe);
 if (n + sizeof(rtl8188f::kWmmInfoIe) <= sizeof(f)) { memcpy(f + n, rtl8188f::kWmmInfoIe, sizeof(rtl8188f::kWmmInfoIe)); n += sizeof(rtl8188f::kWmmInfoIe); }
@@ -1817,7 +1817,8 @@ void RtlWifiDriver::scanAll() {
             uint8_t fc0 = buf[off];
             if (fc0 != 0x80 && fc0 != 0x50) continue;          // beacon or probe response
             frames++;
-
+            uint32_t d3 = rtl8188f::getLe32(buf + 12); uint32_t drvinfo = ((d0 >> 16) & 0xfu) * 8u; int8_t rssi = (drvinfo >= 16 && 24 + drvinfo <= got) ? (int8_t)rtl8188f::extractPhyRssiDbm(buf + 24, drvinfo, d3 & 0x7Fu) : -65;
+            
             const uint8_t *bssid = buf + off + 16;
             uint16_t cap = (uint16_t)(buf[off + 34] | (buf[off + 35] << 8));
             uint32_t ie = off + 36;
@@ -1854,6 +1855,7 @@ void RtlWifiDriver::scanAll() {
                 memcpy(list[n].ssid, ssid, sizeof(ssid));
                 list[n].ch = apCh;
                 list[n].sec = rsn ? 3 : (wpa ? 2 : ((cap & 0x10) ? 1 : 0));
+                list[n].rssiDbm = rssi;
                 n++;
             }
         }
@@ -1867,7 +1869,7 @@ void RtlWifiDriver::scanAll() {
         memcpy(fScanList.entries[k].bssid, list[k].bssid, 6);
         fScanList.entries[k].channel = list[k].ch;
         fScanList.entries[k].security = (list[k].sec >= 2) ? kRtlSecWpa2Psk : kRtlSecOpen;
-        fScanList.entries[k].rssiDbm = -60;
+        fScanList.entries[k].rssiDbm = list[k].rssiDbm;
         size_t sl = strlen(list[k].ssid);
         if (sl > RTL_WIFI_MAX_SSID_LEN) sl = RTL_WIFI_MAX_SSID_LEN;
         fScanList.entries[k].ssidLen = (uint8_t)sl;
@@ -2003,6 +2005,7 @@ bool RtlWifiDriver::connectToCurrentTarget() {
 
 bool RtlWifiDriver::startHardware(IOService *provider) {
     fInterface = nullptr;
+    fApIsHt = false; fReconnectTicks = 0;
     fPipeIn = fPipeOut2 = fPipeOut3 = nullptr;
     fHaveAp = false; fHavePmk = fHavePtk = fHaveMsg1 = fStopOnMsg1 = false;
     fHaveMsg3 = false; fMsg3Len = 0; fStopOnMsg3 = false;
@@ -2025,7 +2028,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fPmkCache.clear(); fRxReorder.reset(0);
 
     if (!super::start(provider)) return false;
-    setProperty("build-tag", "v29.0-clean");
+    setProperty("build-tag", "v29.1-turbo");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
 
@@ -2237,7 +2240,7 @@ UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
     tp.isMulticast   = (hdrPeek[0] & 1) != 0;
     tp.isQosData     = true;
     tp.allowAmpdu    = false;
-    tp.useDriverRate = true; tp.driverRate = (tp.isMulticast || cls.isControlFastLane) ? 0x04 : 0x0B;
+    tp.useDriverRate = true; tp.driverRate = (tp.isMulticast || cls.isControlFastLane) ? 0x04 : (fApIsHt ? 0x13 : 0x0B);
     tp.macId         = 0;
     rtl8188f::buildTxDesc40(slot.buf, tp);
 
@@ -2432,7 +2435,7 @@ void RtlWifiDriver::onWatchdogTick(IOTimerEventSource *sender) { if (fHavePendin
     // If a transient USB error killed RX while still connected, silently revive RX
     if (fKeysUp && fNetifEnabled && !fRxRunning && fRxInflight == 0) {
         startRx();
-    }
+    }    if (fDriverState == kRtlStateRecovering && !fKeysUp && fTargetSsidLen > 0) { if ((++fReconnectTicks % 3u) == 0) connectToCurrentTarget(); } else { fReconnectTicks = 0; }
     if (sender) sender->setTimeoutMS(2000);
 }
 
