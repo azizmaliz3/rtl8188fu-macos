@@ -140,7 +140,10 @@ class RtlWifiDriver : public IOEthernetController {
     void     installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t *gtk16, uint8_t channel);
     uint8_t  fMsg3[400];
     uint16_t fMsg3Len;
-    bool     fHaveMsg3;
+    bool     fHaveMsg3; volatile bool fTxStalled;
+uint8_t fPendingGtk[320];
+uint16_t fPendingGtkLen;
+volatile bool fHavePendingGtk;
     void     selfTest();
     uint8_t  fPmk[32];
     uint8_t  fPtk[48];
