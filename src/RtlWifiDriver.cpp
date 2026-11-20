@@ -71,6 +71,7 @@ OSDefineMetaClassAndStructors(RtlWifiDriver, IOEthernetController)
 // ---------- raw register access ----------
 
 IOReturn RtlWifiDriver::readReg(uint16_t reg, void *buf, uint16_t len) {
+    if (!fInterface || isInactive()) return kIOReturnNoDevice;
     StandardUSB::DeviceRequest req;
     req.bmRequestType = 0xC0;   // device-to-host, vendor, device
     req.bRequest = 0x05;
@@ -83,6 +84,7 @@ IOReturn RtlWifiDriver::readReg(uint16_t reg, void *buf, uint16_t len) {
 
 IOReturn RtlWifiDriver::writeReg(uint16_t reg, const void *buf, uint16_t len) {
     StandardUSB::DeviceRequest req;
+    if (!fInterface || isInactive()) return kIOReturnNoDevice;
     req.bmRequestType = 0x40;   // host-to-device, vendor, device
     req.bRequest = 0x05;
     req.wValue = reg;
@@ -1084,15 +1086,15 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                                 uint16_t pc = (uint16_t)(rp[6] | (rp[7] << 8));
                                 int o = 8;
                                 for (uint16_t q = 0; q < pc && q < 4 && o + 4 <= rl; q++, o += 4)
-                                    m += snprintf(s + m, sizeof(s) - m, " %02x:%02x:%02x:%02x", rp[o], rp[o+1], rp[o+2], rp[o+3]);
+                                    if (m < 0) m = 0; if ((size_t)m >= sizeof(s)) m = sizeof(s) - 1; m += snprintf(s + m, sizeof(s) - m, " %02x:%02x:%02x:%02x", rp[o], rp[o+1], rp[o+2], rp[o+3]);
                                 o = 8 + 4 * pc;
                                 if (o + 2 <= rl) {
                                     uint16_t ac = (uint16_t)(rp[o] | (rp[o+1] << 8));
                                     o += 2;
-                                    m += snprintf(s + m, sizeof(s) - m, " akm");
+                                    if (m < 0) m = 0; if ((size_t)m >= sizeof(s)) m = sizeof(s) - 1; m += snprintf(s + m, sizeof(s) - m, " akm");
                                     for (uint16_t q = 0; q < ac && q < 4 && o + 4 <= rl; q++, o += 4)
-                                        m += snprintf(s + m, sizeof(s) - m, " %02x:%02x:%02x:%02x", rp[o], rp[o+1], rp[o+2], rp[o+3]);
-                                    if (o + 2 <= rl) snprintf(s + m, sizeof(s) - m, " caps %02x%02x", rp[o], rp[o+1]);
+                                        if (m < 0) m = 0; if ((size_t)m >= sizeof(s)) m = sizeof(s) - 1; m += snprintf(s + m, sizeof(s) - m, " %02x:%02x:%02x:%02x", rp[o], rp[o+1], rp[o+2], rp[o+3]);
+                                    if (o + 2 <= rl) { if (m < 0) m = 0; if ((size_t)m >= sizeof(s)) m = sizeof(s) - 1; snprintf(s + m, sizeof(s) - m, " caps %02x%02x", rp[o], rp[o+1]); }
                                 }
                                 setProperty("ap-rsn", s);
                             } else {
@@ -1145,14 +1147,14 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                 }
             }
         }
-        if (!crc && off + 30 <= got && buf[off] == 0x10) {      // association response
+        if (!crc && off + 30 <= got && buf[off] == 0x10 && memcmp(buf + off + 4, &fEfuse[0xd7], 6) == 0 && memcmp(buf + off + 10, fApBssid, 6) == 0) {      // association response
             assocResp++;
             if (assocResp == 1) {
                 assocStatus = (uint32_t)buf[off + 26] | ((uint32_t)buf[off + 27] << 8);
                 assocAid = ((uint32_t)buf[off + 28] | ((uint32_t)buf[off + 29] << 8)) & 0x3fff;
             }
         }
-        if (!crc && off + 40 <= got && (buf[off] & 0x0c) == 0x08) {   // data frame: look for EAPOL (LLC/SNAP 0x888e)
+        if (!crc && off + 40 <= got && (buf[off] & 0x0c) == 0x08 && memcmp(buf + off + 4, &fEfuse[0xd7], 6) == 0 && memcmp(buf + off + 10, fApBssid, 6) == 0) {   // data frame: look for EAPOL (LLC/SNAP 0x888e)
             uint32_t hl = 24 + ((buf[off] & 0x80) ? 2 : 0);
             static const uint8_t kSnap[8] = {0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e};
             if (buf[off + 1] & 0x40) {                                 // protected data frame
@@ -1227,7 +1229,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                         }
                         memcpy(fReplay, buf + es + 9, 8);
                         fHaveMsg1 = true;
-                    } else if (ki == 0x13ca && fHavePtk && flen <= 400 && es + flen <= got) {   // message 3: check its MIC
+                    } else if (ki == 0x13ca && fHavePtk && flen >= 99 && flen <= 400 && es + flen <= got) {   // message 3: check its MIC
                         uint8_t tmp[400];
                         memcpy(tmp, buf + es, flen);
                         memset(tmp + 81, 0, 16);
@@ -1242,7 +1244,7 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
                 }
             }
         }
-        if (!crc && off + 30 <= got && buf[off] == 0xb0) {      // authentication response
+        if (!crc && off + 30 <= got && buf[off] == 0xb0 && memcmp(buf + off + 4, &fEfuse[0xd7], 6) == 0 && memcmp(buf + off + 10, fApBssid, 6) == 0) {      // authentication response
             authResp++;
             if (authResp == 1) authStatus = (uint32_t)buf[off + 28] | ((uint32_t)buf[off + 29] << 8);
         }
@@ -1285,8 +1287,8 @@ void RtlWifiDriver::rxProbe(uint8_t channel, char tag) {
 // Send one management frame through bulk-OUT 0x02 (management queue).
 // 40-byte TX descriptor (rtl8xxxu_txdesc40) followed by the 802.11 frame.
 IOReturn RtlWifiDriver::txMgmt(const uint8_t *frame, uint16_t len, uint8_t rate, uint8_t channel, char tag) {
-    if (!fPipeOut2 || len > 200) return kIOReturnBadArgument;
-    uint8_t pkt[256];
+    if (!fPipeOut2 || len > 280) return kIOReturnBadArgument;
+    uint8_t pkt[320];
     memset(pkt, 0, sizeof(pkt));
     uint8_t *d = pkt;
     memcpy(pkt + 40, frame, len);
@@ -1309,12 +1311,13 @@ IOReturn RtlWifiDriver::txMgmt(const uint8_t *frame, uint16_t len, uint8_t rate,
     IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionOut, total, 1);
     if (!md) return kIOReturnNoMemory;
     memcpy(md->getBytesNoCopy(), pkt, total);
-    uint32_t fifoBefore = rd32(0x0204);
+    uint32_t fifoBefore = tag ? rd32(0x0204) : 0;
     uint32_t got = 0;
     IOReturn r = fPipeOut2->io(md, total, got, 500);
     md->release();
 
-    char key[48];
+    if (tag) {
+        char key[48];
     snprintf(key, sizeof(key), "tx-ch%d%c-status", channel, tag); setProperty(key, (uint64_t)(uint32_t)r, 32);
     snprintf(key, sizeof(key), "tx-ch%d%c-bytes", channel, tag);  setProperty(key, (uint64_t)got, 32);
     snprintf(key, sizeof(key), "txdma-status-ch%d%c", channel, tag);
@@ -1325,6 +1328,7 @@ IOReturn RtlWifiDriver::txMgmt(const uint8_t *frame, uint16_t len, uint8_t rate,
     setProperty(key, (uint64_t)fifoBefore, 32);            // REG_FIFOPAGE
     snprintf(key, sizeof(key), "fifopage-ch%d%c-after", channel, tag);
     setProperty(key, (uint64_t)rd32(0x0204), 32);
+    }
     return r;
 }
 
@@ -1375,7 +1379,7 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     if (!fHaveAp) return kIOReturnBadArgument;
     if (fTargetSsidLen == 0) return kIOReturnBadArgument;
     const uint8_t ssidLen = fTargetSsidLen;
-    uint8_t f[200];
+    uint8_t f[256];
     memset(f, 0, sizeof(f));
     f[0] = 0x00;                                    // management, association request
     memcpy(f + 4, fApBssid, 6);                     // DA = AP
@@ -1383,6 +1387,7 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     memcpy(f + 16, fApBssid, 6);                    // BSSID = AP
     uint16_t n = 24;
     uint16_t cap = (uint16_t)((fApCap & 0x0430) | 0x0001);   // ESS | privacy | short preamble/slot as the AP
+    if (!fIsEncrypted) cap &= ~0x0010;
     f[n++] = cap & 0xff; f[n++] = cap >> 8;
     f[n++] = 0x0a; f[n++] = 0x00;                   // listen interval 10
     f[n++] = 0x00; f[n++] = ssidLen;                // SSID IE
@@ -1395,7 +1400,8 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     if (l > 0 && l <= 16) { f[n++] = 50; f[n++] = (uint8_t)l; memcpy(f + n, p, l); n += l; }
 
     uint8_t group[4] = {0x00, 0x0f, 0xac, 0x04};
-    uint8_t rsnCaps[2] = {0x00, 0x00};
+    if (fIsEncrypted) {
+        uint8_t rsnCaps[2] = {0x00, 0x00};
     l = findIe(fApIes, fApIeLen, 48, &p);           // AP's RSN IE: take its group cipher and capabilities
     if (l >= 8) {
         memcpy(group, p + 2, 4);
@@ -1416,9 +1422,10 @@ IOReturn RtlWifiDriver::txAssoc(uint8_t channel, uint8_t rate, char tag) {
     rsnCaps[0] = 0; rsnCaps[1] = 0;
     f[n++] = rsnCaps[0]; f[n++] = rsnCaps[1];
     memcpy(fOwnRsn, f + rsnStart, 22);
-
-    l = findIe(fApIes, fApIeLen, 45, &p);           // HT capabilities, mirrored
-    if (l == 26) { f[n++] = 45; f[n++] = 26; memcpy(f + n, p, 26); n += 26; }
+    }
+    
+    // 1x1 20MHz HT capabilities:           // HT capabilities, mirrored
+    memcpy(f + n, rtl8188f::kRtl8188fHtCapIe, sizeof(rtl8188f::kRtl8188fHtCapIe)); n += sizeof(rtl8188f::kRtl8188fHtCapIe);
 if (n + sizeof(rtl8188f::kWmmInfoIe) <= sizeof(f)) { memcpy(f + n, rtl8188f::kWmmInfoIe, sizeof(rtl8188f::kWmmInfoIe)); n += sizeof(rtl8188f::kWmmInfoIe); }
     setProperty("assoc-frame-len", (uint64_t)n, 16);
     return txMgmt(f, n, rate, channel, tag);
@@ -2018,7 +2025,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fPmkCache.clear(); fRxReorder.reset(0);
 
     if (!super::start(provider)) return false;
-    setProperty("build-tag", "v28.5-bugfix");
+    setProperty("build-tag", "v29.0-clean");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
 
@@ -2469,7 +2476,7 @@ IOReturn RtlWifiDriver::ucStartScan() {
 }
 
 IOReturn RtlWifiDriver::ucGetScanResults(RtlWifiScanList *out) {
-    memcpy(out, &fScanList, sizeof(*out));
+    if (getCommandGate()) { auto fn = [](OSObject *owner, void *a0, void *, void *, void *) -> IOReturn { auto *d = static_cast<RtlWifiDriver *>(owner); memcpy(a0, &d->fScanList, sizeof(RtlWifiScanList)); return kIOReturnSuccess; }; return getCommandGate()->runAction(fn, out, nullptr, nullptr, nullptr); } memcpy(out, &fScanList, sizeof(*out));
     return kIOReturnSuccess;
 }
 
@@ -2565,7 +2572,7 @@ void RtlWifiDriver::stop(IOService *provider) {
     for (uint32_t i = 0; i < rtl8188f::kRxRingSize; i++) {
         if (fRxMd[i]) { fRxMd[i]->release(); fRxMd[i] = nullptr; }
     }
-    fTxBeRing.destroy(); fTxHiRing.destroy();
+    for (int i = 0; i < 100 && (fTxBeRing.inflight() > 0 || fTxHiRing.inflight() > 0); i++) IOSleep(10); fTxBeRing.destroy(); fTxHiRing.destroy();
     fPmkCache.clear();
     if (fTxFrame)   { IOFree(fTxFrame, 1600); fTxFrame = nullptr; }
     if (fPipeIn)    { fPipeIn->release();    fPipeIn = nullptr; }
