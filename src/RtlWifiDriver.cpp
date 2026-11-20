@@ -2,7 +2,17 @@
 #include "rtl8188fufw.h"          // generated: rtl8188fufw_bin[], rtl8188fufw_bin_len
 #include "RtlWifiTables.h"         // generated: kRtl8188fMacTable[]
 #include "RtlWifiCrypto.h"
+#if __has_include("RtlWifiSecrets.h")
+#if __has_include("RtlWifiSecrets.h")
 #include "RtlWifiSecrets.h"
+#else
+#define RTL_TEST_SSID ""
+#define RTL_TEST_PASSPHRASE ""
+#endif
+#else
+#define RTL_TEST_SSID ""
+#define RTL_TEST_PASSPHRASE ""
+#endif
 #include "RtlWifiPhyTables.h"      // generated: PHY, AGC and RF tables
 #ifndef RTL_TEST_SSID                 // may be defined in RtlWifiSecrets.h; the default is the original test router
 #define RTL_TEST_SSID "TT_4FF8"
