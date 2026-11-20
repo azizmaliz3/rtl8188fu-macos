@@ -110,6 +110,8 @@ class RtlWifiDriver : public IOEthernetController {
     uint32_t fUsbStallRecoveries;
     uint32_t fDriverState;
     int32_t  fLastRssiDbm;
+bool        fApIsHt;
+uint32_t    fReconnectTicks;
     char     fTargetSsid[RTL_WIFI_MAX_SSID_LEN + 1];
     uint8_t  fTargetSsidLen;
     RtlWifiScanList fScanList;
