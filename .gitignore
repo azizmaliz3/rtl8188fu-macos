@@ -1,0 +1,8 @@
+build/
+MacKernelSDK/
+artifact/
+artifact$/
+*.zip
+*.pkg
+src/RtlWifiSecrets.h
+.DS_Store

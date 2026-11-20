@@ -8,7 +8,7 @@ guard args.count >= 2 else {
 }
 
 guard let matching = IOServiceMatching("RtlWifiDriver") else { exit(1) }
-let service = IOServiceGetMatchingService(kIOMasterPortDefault, matching)
+let service = IOServiceGetMatchingService(0, matching)
 if service == 0 {
     print("Error: RtlWifiDriver kext not loaded or RTL8188FU dongle not attached.")
     exit(1)
@@ -27,6 +27,11 @@ case "status":
     let kr = IOConnectCallStructMethod(conn, 0, nil, 0, &buf, &outSize)
     if kr == KERN_SUCCESS {
         buf.withUnsafeBytes { p in
+            let abi = p.load(fromByteOffset: 0, as: UInt32.self)
+            guard abi == 3 else {
+                print("Error: ABI mismatch (expected 3, got \(abi))")
+                exit(1)
+            }
             let state = p.load(fromByteOffset: 4, as: UInt32.self)
             let ch    = p.load(fromByteOffset: 8, as: UInt32.self)
             let rssi  = p.load(fromByteOffset: 12, as: Int32.self)

@@ -90,6 +90,12 @@ int main() {
     rtlcrypto::secure_zero(pmk, sizeof(pmk));
     assert(pmk[0] == 0 && pmk[31] == 0);
 
-    std::printf("ALL V28 ULTIMATE + RING-0 FUZZ HOSTTESTS PASSED!\n");
+    // 9. Verify RTL8188FU 1x1 20MHz HT Cap IE (MCS 0..7 only, no 40MHz, no 2x2 MIMO!)
+    assert(sizeof(rtl8188f::kRtl8188fHtCapIe) == 28);
+    assert(rtl8188f::kRtl8188fHtCapIe[0] == 45 && rtl8188f::kRtl8188fHtCapIe[1] == 26);
+    assert((rtl8188f::kRtl8188fHtCapIe[2] & 0x02) == 0); // 40MHz bit MUST be 0
+    assert(rtl8188f::kRtl8188fHtCapIe[5] == 0xFF && rtl8188f::kRtl8188fHtCapIe[6] == 0x00);
+
+    std::printf("ALL V29 CLEAN + 1x1 HT CAP + RING-0 FUZZ HOSTTESTS PASSED!\n");
     return 0;
 }

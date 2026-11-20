@@ -49,12 +49,24 @@ static constexpr uint8_t  kQselVo            = 0x06;
 static constexpr uint8_t  kQselMgmt          = 0x12;
 
 // Standard WMM Information Element (7 bytes payload) & 802.11n HT Capabilities IE (26 bytes)
+
+// Real RTL8188FU 1x1 20 MHz HT Capabilities IE (26-byte payload, Tag 45)
+// HT Cap Info = 0x002C (20MHz only, Short GI 20MHz, RX STBC 1-stream; NO 40MHz!)
+// A-MPDU Params = 0x1B (64 KB max, 4 us spacing)
+// Supported MCS Set: MCS 0..7 ONLY (0xFF in byte 0, 0x00 in bytes 1..15)
 static constexpr uint8_t kRtl8188fHtCapIe[28] = {
-    45, 26, 0x2C, 0x00, 0x1B,
-    0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    45, 26,
+    0x2C, 0x00,             // HT Capabilities Info (1x1 20MHz + SGI20)
+    0x1B,                   // A-MPDU Parameters
+    0xFF, 0x00, 0x00, 0x00, // Rx MCS Bitmask (MCS 0-7 ONLY, 1 spatial stream!)
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00,             // HT Extended Capabilities
+    0x00, 0x00, 0x00, 0x00, // Transmit Beamforming Capabilities
+    0x00                    // ASEL Capabilities
 };
+
 static constexpr uint8_t kWmmInfoIe[9] = {
     0xDD, 0x07, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00
 };
@@ -169,7 +181,7 @@ static inline void buildTxDesc40(uint8_t *d, const TxDescParams &p) {
     d[2] = static_cast<uint8_t>(kTxDescSize);
     d[3] = static_cast<uint8_t>(0x80u | 0x08u | 0x04u | (p.isMulticast ? 0x01u : 0x00u));
 
-    const uint8_t qsel = p.isQosData ? tidToQsel(p.tid) : kQselMgmt;
+    const uint8_t qsel = p.isQosData ? tidToQsel(p.tid) : 0u;
     uint32_t dw1 = (static_cast<uint32_t>(p.macId) & 0x7Fu) |
                    (static_cast<uint32_t>(qsel) << 8) |
                    p.secType;
@@ -223,6 +235,39 @@ static inline uint16_t writeQosDataHeader(uint8_t *out,
         out[32] = static_cast<uint8_t>((txPn >> 32) & 0xFFu);
         out[33] = static_cast<uint8_t>((txPn >> 40) & 0xFFu);
         off = 34;
+    }
+    out[off + 0] = 0xAA; out[off + 1] = 0xAA; out[off + 2] = 0x03;
+    out[off + 3] = 0x00; out[off + 4] = 0x00; out[off + 5] = 0x00;
+    out[off + 6] = ethHdr14[12];
+    out[off + 7] = ethHdr14[13];
+    return hlen;
+}
+
+static inline uint16_t writeLegacyDataHeader(uint8_t *out,
+                                             const uint8_t ethHdr14[14],
+                                             const uint8_t apBssid[6],
+                                             const uint8_t staMac[6],
+                                             bool encrypted,
+                                             uint64_t txPn) {
+    const uint16_t hlen = encrypted ? 40u : 32u;
+    memset(out, 0, hlen);
+    out[0] = 0x08;                             // Non-QoS Data (for APs without WMM)
+    out[1] = encrypted ? 0x41u : 0x01u;        // To-DS (+ Protected if WPA2)
+    memcpy(out + 4,  apBssid,      6);
+    memcpy(out + 10, staMac,       6);
+    memcpy(out + 16, ethHdr14 + 0, 6);
+
+    uint16_t off = 24;
+    if (encrypted) {
+        out[24] = static_cast<uint8_t>(txPn & 0xFFu);
+        out[25] = static_cast<uint8_t>((txPn >> 8) & 0xFFu);
+        out[26] = 0x00;
+        out[27] = 0x20; // ExtIV | KeyID 0
+        out[28] = static_cast<uint8_t>((txPn >> 16) & 0xFFu);
+        out[29] = static_cast<uint8_t>((txPn >> 24) & 0xFFu);
+        out[30] = static_cast<uint8_t>((txPn >> 32) & 0xFFu);
+        out[31] = static_cast<uint8_t>((txPn >> 40) & 0xFFu);
+        off = 32;
     }
     out[off + 0] = 0xAA; out[off + 1] = 0xAA; out[off + 2] = 0x03;
     out[off + 3] = 0x00; out[off + 4] = 0x00; out[off + 5] = 0x00;

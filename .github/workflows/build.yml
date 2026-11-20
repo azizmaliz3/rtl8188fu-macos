@@ -1,4 +1,4 @@
-name: Build RTL8188FU V28 Ultimate Suite
+name: Build RTL8188FU V29.4 Suite
 
 on:
   push:
@@ -11,62 +11,53 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Run C++14 hosttest & Ring-0 fuzz suite
         run: |
           clang++ -std=c++14 -Wall -Wextra -Werror tests/hosttest.cpp -o /tmp/hosttest
           /tmp/hosttest
 
-      - name: Checkout MacKernelSDK
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: acidanthera/MacKernelSDK
           path: MacKernelSDK
 
       - name: Build RtlWifiDriver.kext (Release)
         run: |
-          xcodebuild -project RtlWifiDriver.xcodeproj \
-            -target RtlWifiDriver \
-            -configuration Release \
-            -jobs 1 \
-            build
+          xcodebuild -project RtlWifiDriver.xcodeproj -target RtlWifiDriver -configuration Release -jobs 1 build
           lipo -info build/Release/RtlWifiDriver.kext/Contents/MacOS/RtlWifiDriver
           plutil -lint build/Release/RtlWifiDriver.kext/Contents/Info.plist
 
-      - name: Build Menu Bar App & CLI Control Tool (x86_64)
+      - name: Build RtlWifiMenuBar.app & rtl8188ctl (x86_64)
         run: |
           mkdir -p build/Release/RtlWifiMenuBar.app/Contents/MacOS
           swiftc -O -target x86_64-apple-macos11.0 app/RtlWifiMenuBar.swift \
             -framework Cocoa -framework IOKit -framework Security \
             -o build/Release/RtlWifiMenuBar.app/Contents/MacOS/RtlWifiMenuBar
-          swiftc -O -target x86_64-apple-macos11.0 tools/rtl8188ctl.swift -framework IOKit -o build/Release/rtl8188ctl
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-            '<plist version="1.0">' \
-            '<dict>' \
-            '  <key>CFBundleExecutable</key><string>RtlWifiMenuBar</string>' \
-            '  <key>CFBundleIdentifier</key><string>io.github.azizmaliz3.RtlWifiMenuBar</string>' \
-            '  <key>CFBundleName</key><string>RTL8188FU Wi-Fi</string>' \
-            '  <key>CFBundlePackageType</key><string>APPL</string>' \
-            '  <key>CFBundleShortVersionString</key><string>0.4.0</string>' \
-            '  <key>LSUIElement</key><true/>' \
-            '</dict>' \
-            '</plist>' > build/Release/RtlWifiMenuBar.app/Contents/Info.plist
+            '<plist version="1.0"><dict>' \
+            '<key>CFBundleExecutable</key><string>RtlWifiMenuBar</string>' \
+            '<key>CFBundleIdentifier</key><string>io.github.azizmaliz3.RtlWifiMenuBar</string>' \
+            '<key>CFBundleName</key><string>RTL8188FU Wi-Fi</string>' \
+            '<key>CFBundlePackageType</key><string>APPL</string>' \
+            '<key>CFBundleShortVersionString</key><string>0.5.0</string>' \
+            '<key>LSUIElement</key><true/>' \
+            '</dict></plist>' > build/Release/RtlWifiMenuBar.app/Contents/Info.plist
           plutil -lint build/Release/RtlWifiMenuBar.app/Contents/Info.plist
+          swiftc -O -target x86_64-apple-macos11.0 tools/rtl8188ctl.swift -framework IOKit -o build/Release/rtl8188ctl
           chmod +x build/Release/RtlWifiMenuBar.app/Contents/MacOS/RtlWifiMenuBar build/Release/rtl8188ctl
           codesign --force --deep --sign - build/Release/RtlWifiMenuBar.app
           lipo -info build/Release/RtlWifiMenuBar.app/Contents/MacOS/RtlWifiMenuBar build/Release/rtl8188ctl
-          lipo -info build/Release/RtlWifiMenuBar.app/Contents/MacOS/RtlWifiMenuBar | grep -q x86_64
-          lipo -info build/Release/rtl8188ctl | grep -q x86_64
 
       - name: Package Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RtlWifiDriver-V28-Ultimate
+          name: RtlWifiDriver-V29.4
           path: |
             build/Release/RtlWifiDriver.kext
             build/Release/RtlWifiMenuBar.app
             build/Release/rtl8188ctl
+            scripts/

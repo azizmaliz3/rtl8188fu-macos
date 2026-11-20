@@ -30,7 +30,10 @@ bool RtlWifiUserClient::start(IOService *provider) {
 }
 
 void RtlWifiUserClient::stop(IOService *provider) {
-    if (fDriver) { fDriver->release(); fDriver = nullptr; }
+    if (fDriver) {
+        fDriver->release();
+        fDriver = nullptr;
+    }
     super::stop(provider);
 }
 
@@ -52,21 +55,21 @@ IOReturn RtlWifiUserClient::externalMethod(uint32_t selector,
 }
 
 IOReturn RtlWifiUserClient::sGetStatus(RtlWifiUserClient *t, void *, IOExternalMethodArguments *a) {
-    if (!t || !t->fDriver || !a->structureOutput) return kIOReturnBadArgument;
+    if (!t || !t->fDriver || t->isInactive() || !a->structureOutput) return kIOReturnBadArgument;
     return t->fDriver->ucGetStatus(reinterpret_cast<RtlWifiStatus *>(a->structureOutput));
 }
 
 IOReturn RtlWifiUserClient::sStartScan(RtlWifiUserClient *t, void *, IOExternalMethodArguments *) {
-    return (t && t->fDriver) ? t->fDriver->ucStartScan() : kIOReturnBadArgument;
+    return (t && t->fDriver && !t->isInactive()) ? t->fDriver->ucStartScan() : kIOReturnNotAttached;
 }
 
 IOReturn RtlWifiUserClient::sGetScanResults(RtlWifiUserClient *t, void *, IOExternalMethodArguments *a) {
-    if (!t || !t->fDriver || !a->structureOutput) return kIOReturnBadArgument;
+    if (!t || !t->fDriver || t->isInactive() || !a->structureOutput) return kIOReturnBadArgument;
     return t->fDriver->ucGetScanResults(reinterpret_cast<RtlWifiScanList *>(a->structureOutput));
 }
 
 IOReturn RtlWifiUserClient::sConnect(RtlWifiUserClient *t, void *, IOExternalMethodArguments *a) {
-    if (!t || !t->fDriver || !a->structureInput) return kIOReturnBadArgument;
+    if (!t || !t->fDriver || t->isInactive() || !a->structureInput) return kIOReturnBadArgument;
     const auto *req = reinterpret_cast<const RtlWifiConnectReq *>(a->structureInput);
     if (req->abiVersion != RTL_WIFI_ABI_VERSION || req->ssidLen == 0 || req->ssidLen > RTL_WIFI_MAX_SSID_LEN)
         return kIOReturnBadArgument;
@@ -74,10 +77,10 @@ IOReturn RtlWifiUserClient::sConnect(RtlWifiUserClient *t, void *, IOExternalMet
 }
 
 IOReturn RtlWifiUserClient::sDisconnect(RtlWifiUserClient *t, void *, IOExternalMethodArguments *) {
-    return (t && t->fDriver) ? t->fDriver->ucDisconnect() : kIOReturnBadArgument;
+    return (t && t->fDriver && !t->isInactive()) ? t->fDriver->ucDisconnect() : kIOReturnNotAttached;
 }
 
 IOReturn RtlWifiUserClient::sGetDiagnostics(RtlWifiUserClient *t, void *, IOExternalMethodArguments *a) {
-    if (!t || !t->fDriver || !a->structureOutput) return kIOReturnBadArgument;
+    if (!t || !t->fDriver || t->isInactive() || !a->structureOutput) return kIOReturnBadArgument;
     return t->fDriver->ucGetDiagnostics(reinterpret_cast<RtlWifiDiagnostics *>(a->structureOutput));
 }

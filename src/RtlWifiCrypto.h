@@ -126,6 +126,10 @@ static inline void prf(const uint8_t *key, size_t klen, const char *label, const
     Hmac h; hmac_init(h, key, klen);
     uint8_t in[160];
     size_t ll = strlen(label);
+    if (ll + 1 + dlen + 1 > sizeof(in)) {
+        secure_zero(&h, sizeof(h));
+        return;
+    }
     memcpy(in, label, ll); in[ll] = 0;
     memcpy(in + ll + 1, data, dlen);
     size_t n = ll + 1 + dlen;
@@ -136,9 +140,16 @@ static inline void prf(const uint8_t *key, size_t klen, const char *label, const
         size_t take = outLen - pos < 20 ? outLen - pos : 20;
         memcpy(out + pos, digest, take);
     }
+    secure_zero(in, sizeof(in));
+    secure_zero(digest, sizeof(digest));
+    secure_zero(&h, sizeof(h));
 }
 
-static inline int cmp_bytes(const uint8_t *a, const uint8_t *b, size_t n) { return memcmp(a, b, n); }
+static inline int cmp_bytes(const uint8_t *a, const uint8_t *b, size_t n) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff;
+}
 
 // PTK = PRF-384(PMK, "Pairwise key expansion", min(AA,SPA) || max(AA,SPA) || min(ANonce,SNonce) || max(ANonce,SNonce))
 static inline void derive_ptk(const uint8_t pmk[32], const uint8_t aa[6], const uint8_t spa[6],
