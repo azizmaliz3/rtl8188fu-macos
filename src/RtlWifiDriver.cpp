@@ -2002,7 +2002,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fRxLoops = 10; fStopOnOffer = fHaveOffer = fOfferProt = fOfferBcast = false;
     fMsg3Retx = 0; fTxPn = 0; fNetif = nullptr; fNetStats = nullptr;
     fNetifEnabled = fKeysUp = false; fIsEncrypted = true; fApSecOffset = 0;
-    fNetTxDropped = 0;
+    fNetTxDropped = 0; fTxStalled = false; fPendingGtkLen = 0; fHavePendingGtk = false;
     for (uint32_t i = 0; i < rtl8188f::kRxRingSize; ++i) fRxMd[i] = nullptr;
     fRxInflight = 0; fRxRunning = false; fRxErrRun = 0;
     fTxFrame = nullptr; fGtkCipher = 0;
@@ -2018,7 +2018,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fPmkCache.clear(); fRxReorder.reset(0);
 
     if (!super::start(provider)) return false;
-    setProperty("build-tag", "v28.4-stable");
+    setProperty("build-tag", "v28.5-bugfix");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
 
@@ -2182,14 +2182,14 @@ void RtlWifiDriver::txBeComplete(unsigned idx, IOReturn status) {
     fTxBeRing.releaseSlot(idx);
     if (status == kIOReturnSuccess) { fNetTxPackets++; if (fNetStats) fNetStats->outputPackets++; fWatchdog.onUsbSuccess(); }
     else { fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++; }
-    if (IOOutputQueue *q = getOutputQueue()) q->service(IOBasicOutputQueue::kServiceAsync);
+    if (IOOutputQueue *q = getOutputQueue()) { if (fTxStalled) { fTxStalled = false; q->start(); } else { q->service(IOBasicOutputQueue::kServiceAsync); } }
 }
 
 void RtlWifiDriver::txHiComplete(unsigned idx, IOReturn status) {
     fTxHiRing.releaseSlot(idx);
     if (status == kIOReturnSuccess) { fNetTxPackets++; if (fNetStats) fNetStats->outputPackets++; fWatchdog.onUsbSuccess(); }
     else { fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++; }
-    if (IOOutputQueue *q = getOutputQueue()) q->service(IOBasicOutputQueue::kServiceAsync);
+    if (IOOutputQueue *q = getOutputQueue()) { if (fTxStalled) { fTxStalled = false; q->start(); } else { q->service(IOBasicOutputQueue::kServiceAsync); } }
 }
 
 // V28 Zero-Copy Dual-Pipe WMM + ARP/DHCP/DNS Fast-Lane TX + USB 512-byte ZLP Guard!
@@ -2210,7 +2210,7 @@ UInt32 RtlWifiDriver::outputPacket(mbuf_t packet, void *) {
     auto cls = rtl8188f::classifyEthHeader(hdrPeek, peekLen);
     bool useHi = false;
     int slotIdx = useHi ? fTxHiRing.acquireSlot() : fTxBeRing.acquireSlot();
-    if (slotIdx < 0) return kIOReturnOutputStall;
+    if (slotIdx < 0) { fTxStalled = true; return kIOReturnOutputStall; }
 
     RtlTxSlot &slot = useHi ? fTxHiRing.slot(static_cast<uint32_t>(slotIdx))
                             : fTxBeRing.slot(static_cast<uint32_t>(slotIdx));
@@ -2331,7 +2331,7 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
     if (fc0 == 0x80 && memcmp(f + 16, fApBssid, 6) == 0) {
         fBeaconSeen = true; fWatchdog.onBeaconReceived(); return false;
     }
-    if (rtl8188f::isDeauthOrDisassoc(fc0) && memcmp(f + 10, fApBssid, 6) == 0) {
+    static const uint8_t kBcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}; if (rtl8188f::isDeauthOrDisassoc(fc0) && memcmp(f + 10, fApBssid, 6) == 0 && (memcmp(f + 4, &fEfuse[0xd7], 6) == 0 || memcmp(f + 4, kBcast, 6) == 0)) {
         fKeysUp = false; fDriverState = kRtlStateRecovering;
         setLinkStatus(kIONetworkLinkValid, 0); return false;
     }
@@ -2367,13 +2367,13 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
             uint32_t elen = 14u + pl;
             mbuf_t m = allocatePacket(elen);
             if (!m) { fNetRxDropped++; continue; }
-            uint8_t *dst = static_cast<uint8_t *>(mbuf_data(m));
-            memcpy(dst, subs[i].da, 6);
-            memcpy(dst + 6, subs[i].sa, 6);
-            dst[12] = static_cast<uint8_t>(subs[i].etherType >> 8);
-            dst[13] = static_cast<uint8_t>(subs[i].etherType);
-            memcpy(dst + 14, subs[i].payload, pl);
-            mbuf_setlen(m, elen); mbuf_pkthdr_setlen(m, elen);
+            uint8_t eth[14];
+            memcpy(eth, subs[i].da, 6);
+            memcpy(eth + 6, subs[i].sa, 6);
+            eth[12] = static_cast<uint8_t>(subs[i].etherType >> 8);
+            eth[13] = static_cast<uint8_t>(subs[i].etherType);
+            mbuf_copyback(m, 0, 14, eth, MBUF_DONTWAIT);
+            mbuf_copyback(m, 14, pl, subs[i].payload, MBUF_DONTWAIT);
             fNetif->inputPacket(m, elen, IONetworkInterface::kInputOptionQueuePacket);
             fNetRxPackets++; fBeaconSeen = true; fWatchdog.onBeaconReceived(); fAmsduSubframes++; if (fNetStats) fNetStats->inputPackets++;
             any = true;
@@ -2384,7 +2384,7 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
     if (bodyLen < 8 || f[p] != 0xaa || f[p + 1] != 0xaa || f[p + 2] != 0x03) return false;
     uint16_t et = (uint16_t)((f[p + 6] << 8) | f[p + 7]);
     if (et == 0x888e) {
-        if (fIsEncrypted) handleGtkRekey(f + p + 8, bodyLen - 8);
+        if (fIsEncrypted && bodyLen - 8 <= sizeof(fPendingGtk)) { memcpy(fPendingGtk, f + p + 8, bodyLen - 8); fPendingGtkLen = static_cast<uint16_t>(bodyLen - 8); fHavePendingGtk = true; }
         return false;
     }
 
@@ -2395,12 +2395,12 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
     if (!m) { fNetRxDropped++; if (fNetStats) fNetStats->inputErrors++; return false; }
 
     // Zero-copy direct write into mbuf_data()!
-    uint8_t *dst = static_cast<uint8_t *>(mbuf_data(m));
-    memcpy(dst, f + 4, 6);
-    memcpy(dst + 6, f + 16, 6);
-    dst[12] = static_cast<uint8_t>(et >> 8); dst[13] = static_cast<uint8_t>(et);
-    memcpy(dst + 14, f + p + 8, pl);
-    mbuf_setlen(m, elen); mbuf_pkthdr_setlen(m, elen);
+    uint8_t eth[14];
+    memcpy(eth, f + 4, 6);
+    memcpy(eth + 6, f + 16, 6);
+    eth[12] = static_cast<uint8_t>(et >> 8); eth[13] = static_cast<uint8_t>(et);
+    mbuf_copyback(m, 0, 14, eth, MBUF_DONTWAIT);
+    mbuf_copyback(m, 14, pl, f + p + 8, MBUF_DONTWAIT);
 
     // 64-slot A-MPDU sequence reorder window for unicast QoS data
     if (false && isQos && (f[4] & 1) == 0) {
@@ -2420,7 +2420,7 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
     return true;
 }
 
-void RtlWifiDriver::onWatchdogTick(IOTimerEventSource *sender) {
+void RtlWifiDriver::onWatchdogTick(IOTimerEventSource *sender) { if (fHavePendingGtk) { fHavePendingGtk = false; handleGtkRekey(fPendingGtk, fPendingGtkLen); }
     if (isInactive() || !fInterface) return;
     // If a transient USB error killed RX while still connected, silently revive RX
     if (fKeysUp && fNetifEnabled && !fRxRunning && fRxInflight == 0) {
