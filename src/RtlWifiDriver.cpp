@@ -1933,7 +1933,7 @@ void RtlWifiDriver::handleGtkRekey(const uint8_t *eapol, size_t len) {
     rtlcrypto::secure_zero(&res, sizeof(res));
 }
 
-boobool RtlWifiDriver::connectToCurrentTarget() {
+bool RtlWifiDriver::connectToCurrentTarget() {
     if (!fPipeIn || fTargetSsidLen == 0) return false;
     setBssidFilter(false);
     fDriverState = kRtlStateConnecting;
@@ -2184,14 +2184,14 @@ void RtlWifiDriver::txBeComplete(unsigned idx, IOReturn status) {
     fTxBeRing.releaseSlot(idx);
     if (status == kIOReturnSuccess) { fNetTxPackets++; if (fNetStats) fNetStats->outputPackets++; fWatchdog.onUsbSuccess(); }
     else { fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++; }
-    if (IOOutputQueue *q = getOutputQueue()) q->service(IOOutputQueue::kServiceAsync);
+    if (IOOutputQueue *q = getOutputQueue()) q->service(IOBasicOutputQueue::kServiceAsync);
 }
 
 void RtlWifiDriver::txHiComplete(unsigned idx, IOReturn status) {
     fTxHiRing.releaseSlot(idx);
     if (status == kIOReturnSuccess) { fNetTxPackets++; if (fNetStats) fNetStats->outputPackets++; fWatchdog.onUsbSuccess(); }
     else { fNetTxErrors++; if (fNetStats) fNetStats->outputErrors++; fUsbErrWindow++; }
-    if (IOOutputQueue *q = getOutputQueue()) q->service(IOOutputQueue::kServiceAsync);
+    if (IOOutputQueue *q = getOutputQueue()) q->service(IOBasicOutputQueue::kServiceAsync);
 }
 
 // V28 Zero-Copy Dual-Pipe WMM + ARP/DHCP/DNS Fast-Lane TX + USB 512-byte ZLP Guard!
