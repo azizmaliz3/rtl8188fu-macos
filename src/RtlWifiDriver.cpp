@@ -1703,7 +1703,6 @@ void RtlWifiDriver::installKeys(uint8_t gtkCipher, uint8_t gtkId, const uint8_t 
     // V27: Activate 8051 H2C firmware rate adaptation (MCS0-MCS7 + SGI), keepalive, and ADDBA
     sendH2c(rtl8188f::buildH2cMediaStatus(true, 0));
     sendH2c(rtl8188f::buildH2cRaMask(0, fHt40Active, true));
-    sendH2c(rtl8188f::buildH2cKeepAlive(true, 10));
     uint8_t addba[40];
     uint16_t alen = rtl8188f::buildAddbaRequest(addba, sizeof(addba), fApBssid, &fEfuse[0xd7], 1, 0, 64);
     if (alen > 0) txMgmt(addba, alen, 0x04, fApChannel, 0);
@@ -1982,7 +1981,6 @@ bool RtlWifiDriver::connectToCurrentTarget() {
         fDriverState = kRtlStateConnected;
         sendH2c(rtl8188f::buildH2cMediaStatus(true, 0));
         sendH2c(rtl8188f::buildH2cRaMask(0, fHt40Active, true));
-        sendH2c(rtl8188f::buildH2cKeepAlive(true, 10));
     }
 
     if (fKeysUp) {
@@ -2020,7 +2018,7 @@ bool RtlWifiDriver::startHardware(IOService *provider) {
     fPmkCache.clear(); fRxReorder.reset(0);
 
     if (!super::start(provider)) return false;
-    setProperty("build-tag", "v28.3-scanfix");
+    setProperty("build-tag", "v28.4-stable");
     fInterface = OSDynamicCast(IOUSBHostInterface, provider);
     if (!fInterface || !fInterface->open(this)) { fInterface = nullptr; return false; }
 
@@ -2423,29 +2421,10 @@ bool RtlWifiDriver::rxFrame(const uint8_t *f, uint32_t n, uint32_t d0) {
 }
 
 void RtlWifiDriver::onWatchdogTick(IOTimerEventSource *sender) {
-    // Flush any aged out-of-order RX reorder slots
-    if (fRxReorder.storedCount() > 0 && fNetif) {
-        fRxReorder.flushAll([this](mbuf_t ready) {
-            fNetif->inputPacket(ready, (UInt32)mbuf_pkthdr_len(ready), IONetworkInterface::kInputOptionQueuePacket);
-            fNetRxPackets++; fBeaconSeen = true; fWatchdog.onBeaconReceived(); if (fNetStats) fNetStats->inputPackets++;
-        });
-        fNetif->flushInputQueue();
-    }
-
-    bool stalled = (fTxBeRing.inflight() >= (int32_t)(rtl8188f::kTxBeRingSize - 2));
-    auto act = fWatchdog.tick(fKeysUp, fBeaconSeen, fUsbErrWindow, stalled);
-    fBeaconSeen = false; fUsbErrWindow = 0;
-
-    if (fKeysUp) {
-        uint8_t gain = fDig.updateFromRssi(fLastRssiDbm); if (gain > 0x2E) gain = 0x2E; wr8(rtl8188f::kRegOfdm0XaAgc1, gain);
-    }
-    if (act == rtl8188f::kRecoveryClearPipeStall) {
-        if (fPipeOut3) fPipeOut3->clearStall(false);
-        if (fPipeOut2) fPipeOut2->clearStall(false);
-        if (fPipeIn)   fPipeIn->clearStall(false);
-        fUsbStallRecoveries++;
-    } else if (act == rtl8188f::kRecoverySoftReassoc && fTargetSsidLen > 0) {
-        stopRx(); fKeysUp = false; connectToCurrentTarget();
+    if (isInactive() || !fInterface) return;
+    // If a transient USB error killed RX while still connected, silently revive RX
+    if (fKeysUp && fNetifEnabled && !fRxRunning && fRxInflight == 0) {
+        startRx();
     }
     if (sender) sender->setTimeoutMS(2000);
 }
